@@ -25,21 +25,20 @@ Five stages, each operable from a fresh session via artifacts alone:
 
 [`_shared/pipeline-contract.md`](./_shared/pipeline-contract.md) is the single source of truth for artifact locations, the TODO schema, manifest/finding formats, the model floor, and the universal rules. Every skill reads it on invocation.
 
-## Codex adapters
+## Codex
 
-Codex-native wrappers live under [`codex/skills/`](./codex/skills/). They keep
-the same pipeline artifacts and shared contract, but translate Claude-specific
-runtime language to Codex. No `AGENTS.md` is included; each target repo owns its
-own repo-specific `AGENTS.md`.
-
-Install them globally for Codex with symlinks:
+Codex reads the **same** skills — there is no separate Codex copy. Symlink each
+skill into Codex's user skill directory so one `git pull` updates both tools:
 
 ```bash
 mkdir -p ~/.agents/skills
 for skill in research-plan write-plan execute-plan review-plan document-plan commit-push; do
-  ln -sfn ~/.claude/skills/codex/skills/$skill ~/.agents/skills/$skill
+  ln -sfn ~/.claude/skills/$skill ~/.agents/skills/$skill
 done
 ```
 
 Restart Codex after the first install, then use `/skills` or mention a skill
-such as `$research-plan`.
+such as `$research-plan`. The skills are mostly tool-agnostic prose; the one
+Claude-ism is the Opus/Fable model floor in the shared contract — under Codex,
+just use its strongest available model. Repo-specific guidance still belongs in
+each target repo's own `AGENTS.md`.

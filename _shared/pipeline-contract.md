@@ -45,14 +45,14 @@ Never write a pipeline artifact anywhere else — not the repo root, not a subpr
 ### Phase 1: <coherent, independently-valid chunk>
 - [ ] Step — Files/symbols: `sym in path` — Depends on: <step|none> — Verify: <test/command/observable>
 - [ ] (phase boundary) build + existing tests green
-### Phase 2 (Review checkpoint): <chunk later phases build on>
+### Phase 2: <chunk later phases build on>
 ## Validation — the repo's real commands
 ## Migration / rollout — or "none"
 ## Out of scope — explicitly excluded
 ## Open questions — tag (blocking) ones
 ```
 
-`(Review checkpoint)` on a phase heading marks a boundary where `/execute-plan` pauses for a scoped `/review-plan` pass before later phases build on it. `/write-plan` marks them on risky boundaries (persistence/contract/security changes, or foundations several later phases depend on) — not on every phase.
+`/execute-plan` runs every phase in sequence straight through to completion — there are no mid-plan review stops. `/review-plan` runs once, after the full plan is implemented, scoped to the `## Changed manifest`.
 
 **Appended as the pipeline runs:**
 

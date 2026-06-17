@@ -17,7 +17,7 @@ Five stages, each operable from a fresh session via artifacts alone:
 ```
 
 - **research-plan** — isolated Explore subagents produce a cited brief (`research/RESEARCH_<feature>.md`); no code.
-- **write-plan** — turns the brief into an ordered, verifiable plan (`plans/TODO_<feature>.md`) with acceptance criteria + Review checkpoints; no code.
+- **write-plan** — turns the brief into an ordered, verifiable plan (`plans/TODO_<feature>.md`) with acceptance criteria; no code.
 - **execute-plan** — implements unit by unit, red-before-green, checkpointing the Changed manifest after every unit; resumable; never commits.
 - **review-plan** — 3 adversarial reviewers scoped to the manifest; fixes confirmed defects in place.
 - **document-plan** — updates only docs whose recorded invariant changed, per the repo's doc-map.

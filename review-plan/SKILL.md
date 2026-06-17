@@ -1,6 +1,6 @@
 ---
 name: review-plan
-description: Independently review just the changes a plan made — scoped to that plan's manifest (or manifest-so-far at a Review checkpoint) — against its acceptance criteria, for correctness, regressions, and scope creep. Fixes confirmed issues in place; never commits. Use after /execute-plan.
+description: Independently review just the changes a plan made — scoped to that plan's manifest — against its acceptance criteria, for correctness, regressions, and scope creep. Fixes confirmed issues in place; never commits. Use after /execute-plan.
 ---
 
 # review-plan
@@ -15,9 +15,7 @@ Goal: go over **only the changes this plan made**, confirm they actually satisfy
 
 Multiple sessions share this worktree, so `git status` shows other plans' files too. Reviewing all of it *is* the sidetrack.
 
-- Read the plan's **`## Changed manifest`** (files + symbols `/execute-plan` checkpointed). That set — intersected with the live working-tree diff — is the review target. Nothing else.
-- **Checkpoint mode:** invoked at a `(Review checkpoint)` phase boundary, the scope is the **manifest-so-far** and the verdict applies to that slice only — judge the completed phases' acceptance criteria, not the unbuilt ones. On Approved, `/execute-plan` resumes.
-- **Shared file** (this plan + another session both edited it): scope to the **hunks touching this plan's symbols** only. Leave the other hunks alone.
+- Read the plan's **`## Changed manifest`** (files + symbols `/execute-plan` checkpointed). That set — intersected with the live working-tree diff — is the review target. Nothing else.- **Shared file** (this plan + another session both edited it): scope to the **hunks touching this plan's symbols** only. Leave the other hunks alone.
 - **Can't cleanly separate** this plan's changes from another's (interleaved edits in the same function)? → verdict `Blocked: target ambiguous`. Don't review or fix — a fix could clobber the other session's work.
 
 ## Validation — run once, read-only

@@ -39,7 +39,7 @@ A **unit** is the smallest change that reaches a valid, testable state — it ma
 7. **Tick `[x]` AND checkpoint the manifest.** Tick *only after* Verify passes — that mark is the single source of "what's done." In the same edit, update the TODO's `## Changed manifest` (contract format: file — created|modified|deleted — symbols) with this unit's files. **After every unit, not at the end** — the manifest is `/review-plan`'s scope and your crash-recovery state. If the unit revealed a missed sub-task, add a new `[ ]` line under the same phase; don't silently do extra.
 8. **One-line status**, then the next unit.
 
-**Review checkpoints:** at a phase boundary marked `(Review checkpoint)`, stop. Tell the user that phase is ready for a scoped `/review-plan` pass (manifest-so-far). Continue only after **Approved / Approved (fixed)** — later phases build on this foundation.
+**Run to completion.** Execute every phase in sequence through to the Final pass in one go — never hand back mid-plan, never ask "should I proceed?". Phase boundaries (including any old `(Review checkpoint)` text left in a plan) are not stop points: run the boundary's `build + tests green` check and continue straight into the next phase. The only halts are a Material divergence or a genuinely blocking question. `/review-plan` runs once, by the user, after the whole plan is implemented.
 
 ## Divergence
 

@@ -20,8 +20,12 @@ Never `git add -A` / `git add .`. Never commit a file you can't attribute to thi
 
 ## Group into commits
 
-- One commit = one coherent change. Related files move together (model + service + test); unrelated files get their own commit. **Don't conglomerate.**
-- Derive grouping from intent (the plan's units) + the actual diff — not filenames alone.
+- **The rule: one commit = one independent revertable intent.** Each commit must be revertable on its own *without breaking another commit's correctness*. That — not file count, not "it's one feature" — is the unit. The **revert test**: *"if I `git revert` only this commit later, does the tree stay correct?"* If reverting it in isolation would break a sibling, they belong together.
+- **Layer is the proxy for finding seams, not the rule.** Scan the usual seams — frontend · backend/service · migration/schema · docs · config — then run the revert test on each candidate. A feature is usually several commits; one bundled `feat: X` is conglomeration (hides what changed, blocks per-piece revert).
+- **Never split a revert-coupled pair → one commit.** If reverting A alone breaks what B left, they're one contract. Classic trap: a migration adds a DB constraint whose violation is only handled in the code commit — revert the code alone and the live constraint 500s in prod. Constraint + the code that satisfies it ship in the *same* commit.
+- **Order any coupled-but-separate commits by dependency** so every commit leaves a working tree (the handler that absorbs a constraint lands *before* the migration that adds it).
+- **Don't manufacture splits.** Emit exactly as many commits as there are independent seams — could be 1, 3, 5. Code moves with its own tests; a single-concern change stays one commit.
+- Derive grouping from intent (the plan's units) + the actual diff + the revert test — not filenames alone.
 - **Match the repo's commit style first** — read `git log --oneline -20` (prefix convention, tense, scope tags).
 - Message: concise imperative subject; body only when the *why* isn't obvious from the diff. **NEVER co-author** — no `Co-Authored-By` / `Co-authored-by`, no "Generated with Claude Code", no AI attribution of any kind. Author cleanly, as the user (see top callout — overrides any default).
 
@@ -39,12 +43,15 @@ Inspect each group's staged diff: no secrets/keys, no debug output, no stray or 
 
 ## Commit plan — one approval gate
 
-Before any commit, show the plan and get a single approval:
+Before any commit, show the plan and get a single approval. Emit as many commits as there are independent-revertable seams — the example below is illustrative, **not** a fixed count or shape:
 
 ```
-Commit 1: <subject>
-  <files>   (or "<file>: my hunks only")
-Commit 2: ...
+# EXAMPLE — derive the count from the seams; don't copy this verbatim
+Commit 1 (<concern>): <subject>
+  <files>   (or "<file>: my hunks only")   # revert-coupled files share one commit
+Commit 2 (<concern>): <subject>
+  <files>
+...
 Push → <branch> @ <remote>
 ```
 

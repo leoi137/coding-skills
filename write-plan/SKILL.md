@@ -29,6 +29,7 @@ Goal: turn a research brief (or a clear ask) into an **ordered, verifiable, file
 4. **Write `<repo-root>/plans/TODO_<feature>.md`** (the contract's canonical home — never the repo root or a subproject dir) using the contract's **TODO schema** exactly: its section headings are how later stages find things.
    - **Phase on dependency boundaries, not item count.** A phase is a chunk that reaches a valid, testable state before the next starts.
    - **Don't add `(Review checkpoint)` markers.** `/execute-plan` runs every phase straight through to completion; there is no mid-plan pause to plan around. Review happens once at the end via `/review-plan`.
+   - **Publish the `## Files` list to the session board** (contract §Session board) as this plan's claims, `Stage: write` — the earliest conflict signal other sessions get. If the claims overlap another plan's, name the collision in `## Open questions` (blocking if the same symbols) instead of proceeding silently.
 
 5. **Resolve blocking decisions.** A safe, convention-consistent default → state it as an explicit assumption and proceed. No safe default → leave `Status: Blocked` and name the exact decision. Don't mark `Ready` while a blocking question remains.
 

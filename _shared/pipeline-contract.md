@@ -14,7 +14,36 @@ Every `Agent` call in every stage runs on the frontier tier — **Opus or Fable,
 
 - **No commits, stashes, pushes, or destructive git** in any stage except `/commit-push`. Work lands in the uncommitted working tree for the user to read; the TODO checklist is the tracker.
 - **Preserve other sessions' work.** The worktree is shared. Never revert or overwrite hunks another session produced; scope every operation to this plan's own files and symbols.
+- **Check the session board** (below) at the start of every stage, and keep your plan's entry current. It is how sessions see each other *before* colliding instead of after.
 - **Write boundaries:** code edits only in `/execute-plan` (plus confirmed-defect fixes in `/review-plan`); doc edits only in `/document-plan`; research and planning produce artifacts only.
+
+## Session board — multi-session coordination
+
+Multiple sessions run against the same repo at once. The board makes each session's intent visible to all the others: **`<repo-root>/plans/SESSIONS.md`** — one board per repo, live coordination state, **never committed** (`/commit-push` always excludes it; add it to `.gitignore` if the repo hasn't already).
+
+One `## <feature>` section per plan in flight:
+
+```markdown
+# Session board — live, do not commit
+<!-- One section per plan. Edit ONLY your own section. -->
+
+## <feature>
+- Plan: plans/TODO_<feature>.md
+- Stage: research | write | execute | review | document | commit
+- Heartbeat: <UTC from `date -u +"%Y-%m-%d %H:%M"`>
+- Claimed files:
+  - `path/a.ts`
+  - `path/b.ts`
+```
+
+Protocol — every stage, right after reading this contract:
+
+1. **Read the board.** Missing → create it from the template above. Claims come from the plan's `## Files` section (from `/write-plan` onward) and are kept in sync with the `## Changed manifest` as execution reveals new files.
+2. **Conflict check.** Intersect the files this stage will touch with every *other* section's claims. Overlap → never touch the shared file silently: scope to your own symbols/hunks where the stage's shared-file rules allow it, otherwise stop and surface ("`<other-feature>` claims `path` — serialize or re-scope?"). A claim means *ask before touching*, not *never touch*.
+3. **Register.** Add or update **your plan's own section only** — stage, heartbeat, claims. Re-read the board immediately before editing, and edit by section (anchored Edit) — **never rewrite the whole file**, that's how a concurrent session's update gets clobbered. Refresh the heartbeat at every stage start/end and at every `/execute-plan` unit checkpoint.
+4. **Release.** `/commit-push` deletes the plan's section when its commits land (alongside the TODO/RESEARCH cleanup offer). A section whose heartbeat is >24h old with no matching dirty files in the worktree is stale — confirm with the user, then prune.
+
+The board is coordination state, not documentation: it records *intent and ownership*, nothing else. The TODO stays the source of truth for progress; the board only answers "who is touching what, right now."
 
 ## Artifact locations & naming
 

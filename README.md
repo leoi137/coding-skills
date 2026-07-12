@@ -25,6 +25,8 @@ Five stages, each operable from a fresh session via artifacts alone:
 
 [`_shared/pipeline-contract.md`](./_shared/pipeline-contract.md) is the single source of truth for artifact locations, the TODO schema, manifest/finding formats, the model floor, and the universal rules. Every skill reads it on invocation.
 
+**Multi-session coordination:** each repo keeps a live session board at `<repo-root>/plans/SESSIONS.md` (never committed) — one section per plan in flight with stage, heartbeat, and claimed files. Every stage reads it on start, registers its own section, and checks its claims against the others before touching shared files; `/commit-push` releases the section when the plan ships. Protocol in the contract's "Session board" section.
+
 ## Codex
 
 Codex reads the **same** skills — there is no separate Codex copy. Symlink each

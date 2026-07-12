@@ -13,7 +13,7 @@ Goal: go over **only the changes this plan made**, confirm they actually satisfy
 
 ## Scope — the plan's manifest, NOT the whole diff
 
-Multiple sessions share this worktree, so `git status` shows other plans' files too. Reviewing all of it *is* the sidetrack.
+Multiple sessions share this worktree, so `git status` shows other plans' files too. Reviewing all of it *is* the sidetrack. Set this plan's session-board entry to `Stage: review` (contract §Session board) — and use the board's other sections to *name* which plan owns foreign hunks in shared files.
 
 - Read the plan's **`## Changed manifest`** (files + symbols `/execute-plan` checkpointed). That set — intersected with the live working-tree diff — is the review target. Nothing else.- **Shared file** (this plan + another session both edited it): scope to the **hunks touching this plan's symbols** only. Leave the other hunks alone.
 - **Can't cleanly separate** this plan's changes from another's (interleaved edits in the same function)? → verdict `Blocked: target ambiguous`. Don't review or fix — a fix could clobber the other session's work.

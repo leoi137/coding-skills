@@ -13,7 +13,7 @@ Goal: produce an accurate, decision-useful model of a feature **without pollutin
 
 ## How to run
 
-1. **Restate the target** in one sentence with explicit scope. If vague, ask one clarifying question or proceed on a stated interpretation — never guess silently. Record the branch/commit so citations are tied to a snapshot.
+1. **Restate the target** in one sentence with explicit scope. If vague, ask one clarifying question or proceed on a stated interpretation — never guess silently. Record the branch/commit so citations are tied to a snapshot. Register `<feature>` on the session board (contract §Session board) with `Stage: research` — no file claims yet, this stage is read-only, but other sessions see the pipeline is in flight.
 
 2. **Scout first if the territory is unknown.** When entry points and structure aren't already clear, spawn ONE cheap scout subagent to map the directory tree, top-level modules, key symbols, and dead/generated/vendored zones to exclude (stale plan files in `plans/`/`research/` are context, not current truth — don't treat them as live state). Decompose against its map, not a guess. If you already know the entry points, skip to step 3.
 

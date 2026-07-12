@@ -16,6 +16,7 @@ Goal: keep the docs true to the code by updating **only the documentation the ju
 - A `plans/TODO_<feature>.md` whose `## Review` verdict is **Approved** or **Approved (fixed)**. Don't document a `Changes required` or `Blocked` change — you'd be recording something about to change.
 - Read the plan's **`## Changed manifest`** (files + symbols), `## Result`, and `## Review`. That manifest is your scope. Everything you need is in the artifacts — this stage runs identically in a fresh session.
 - Read the matching `research/RESEARCH_<feature>.md` if present — its **Doc drift** section is a ready-made to-do list this stage closes out.
+- Set this plan's session-board entry to `Stage: document` and add the doc files you'll touch to its claims (contract §Session board) — doc files collide across sessions just like code.
 
 ## Find what to document — follow the repo's doc-map, don't invent one
 

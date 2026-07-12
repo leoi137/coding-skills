@@ -16,7 +16,7 @@ Decide the exact file/symbol set this skill may commit. In order:
 1. **Plan flow (the common case).** If a `TODO_<feature>.md` for this work has a `## Result` → **Changed manifest** (files + symbols), that manifest *is* the scope. Symbols matter — they're how you stage your hunks out of a shared file. If `## Review` exists it should read **Approved** / **Approved (fixed)**; don't commit a `Changes required` / `Blocked` plan without confirming. Several plans in play → each is its own commit group.
 2. **No plan.** Scope to the files **this chat session actually edited** (your own Edit/Write history this conversation) — *not* the whole dirty worktree.
 
-Never `git add -A` / `git add .`. Never commit a file you can't attribute to this session.
+Never `git add -A` / `git add .`. Never commit a file you can't attribute to this session. **Never commit the session board** (`plans/SESSIONS.md` — contract §Session board); read it first instead — it tells you which plan owns the other hunks in a shared file, turning overlap guesses into named attributions.
 
 ## Group into commits
 
@@ -59,7 +59,7 @@ Surface here: every shared-file/hunk decision, anything left uncommitted, and wh
 
 ## Plan-artifact lifecycle — offer the cleanup
 
-Plan artifacts are ephemeral; git history is the archive (see `~/.claude/skills/_shared/pipeline-contract.md`). When committing a plan flow whose TODO reads `Status: Done` (or `## Review` is Approved and `## Docs` is written), **include deleting that plan's `plans/TODO_<feature>.md` + `research/RESEARCH_<feature>.md` in the commit plan** as its own line — the user approves it with the rest. If the user declines or the plan isn't finished, leave the artifacts; never delete another plan's artifacts.
+Plan artifacts are ephemeral; git history is the archive (see `~/.claude/skills/_shared/pipeline-contract.md`). When committing a plan flow whose TODO reads `Status: Done` (or `## Review` is Approved and `## Docs` is written), **include deleting that plan's `plans/TODO_<feature>.md` + `research/RESEARCH_<feature>.md` in the commit plan** as its own line — the user approves it with the rest. If the user declines or the plan isn't finished, leave the artifacts; never delete another plan's artifacts. Once the plan's commits land, **delete its section from the session board** (release the claims) — the board section is edited directly, not committed.
 
 ## Commit + push
 

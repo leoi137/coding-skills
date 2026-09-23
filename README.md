@@ -27,6 +27,16 @@ Five stages, each operable from a fresh session via artifacts alone:
 
 **Multi-session coordination:** each repo keeps a live session board at `<repo-root>/plans/SESSIONS.md` (never committed) — one section per plan in flight with stage, heartbeat, and claimed files. Every stage reads it on start, registers its own section, and checks its claims against the others before touching shared files; `/commit-push` releases the section when the plan ships. Protocol in the contract's "Session board" section.
 
+## Linear tickets: `/ticket`
+
+In a repo that has `.claude/linear.json`, every change belongs to a Linear ticket. The `ticket` skill finds or creates the ticket and asks you once per piece of work. It moves the ticket In Progress on the first edit, In Review when the PR opens and Done on merge, and it puts the ID where Linear's GitHub integration links it. Three hooks back it up:
+
+- **gate:** no edit without a ticket bound to the session, and no commit or PR without the ID
+- **prompt context:** the bound ticket is shown each turn, so drift gets noticed
+- **status line:** shows the bound ticket
+
+The pipeline stages pick the ticket up through the contract's "Linear ticket" section. The hooks and status line are installed once per machine in `~/.claude/settings.json`: see [`ticket/references/setup.md`](./ticket/references/setup.md).
+
 ## Codex
 
 Codex reads the **same** skills — there is no separate Codex copy. Symlink each

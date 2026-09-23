@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# ticket — bind a Claude Code session's work to a Linear ticket.
+#
+# The binding is local state the hooks read; Linear itself is changed through the Linear MCP tools,
+# never from here. State lives in ~/.claude/state/ticket/<session-id>.json:
+#   { "session": "<id>", "updated_at": "...",
+#     "repos": { "<repo root>": { "active": {id,title,url,status,bound_at} | null,
+#                                  "history": [ {…, unbound_at} ],
+#                                  "exempt": {reason, at} | null } } }
+# A "repo" is the directory holding .claude/linear.json.
+set -euo pipefail
+
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../hooks" && pwd -P)/lib.sh"
+
+usage() {
+  cat <<'EOF'
+ticket — bind this Claude Code session's work to a Linear ticket.
+
+  ticket bind <ID> [--title T] [--url U] [--status S]   make <ID> the active ticket (the previous one moves to history)
+  ticket status <S>                                     record the active ticket's new Linear status
+  ticket exempt [reason]                                the user chose "no ticket" for this session: lift the edit gate
+  ticket unbind                                         drop the active ticket (kept in history)
+  ticket show [--json]                                  this session's binding in the repo
+  ticket recent [--limit N]                             tickets any session bound in this repo, newest first
+  ticket config                                         print the repo's .claude/linear.json
+
+  --repo <dir>      repo to act on (default: walk up from the current directory to .claude/linear.json)
+  --session <id>    session to act on (default: $CLAUDE_CODE_SESSION_ID)
+EOF
+}
+
+die() { printf 'ticket: %s\n' "$*" >&2; exit 1; }
+now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+cmd="${1:-}"
+[ -n "$cmd" ] || { usage; exit 1; }
+shift
+
+repo_arg="" session="${CLAUDE_CODE_SESSION_ID:-}" title="" url="" status="" json=0 limit=5
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) repo_arg="${2:-}"; shift 2 ;;
+    --session) session="${2:-}"; shift 2 ;;
+    --title) title="${2:-}"; shift 2 ;;
+    --url) url="${2:-}"; shift 2 ;;
+    --status) status="${2:-}"; shift 2 ;;
+    --limit) limit="${2:-5}"; shift 2 ;;
+    --json) json=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+set -- ${args[@]+"${args[@]}"}
+
+case "$cmd" in -h|--help|help) usage; exit 0 ;; esac
+
+command -v jq >/dev/null || die "jq is required"
+
+start="${repo_arg:-$PWD}"
+case "$start" in "~"*) start="$HOME${start#\~}" ;; esac
+found=$(ticket_find_root "$start") || die "no .claude/linear.json at or above $start — pass --repo <dir>"
+repo=$(ticket_canon "$found")
+
+if [ "$cmd" = config ]; then
+  cat "$repo/.claude/linear.json"
+  exit 0
+fi
+
+if [ "$cmd" = recent ]; then
+  shopt -s nullglob
+  files=("$TICKET_STATE_DIR"/*.json)
+  [ ${#files[@]} -gt 0 ] || exit 0
+  jq -r --arg r "$repo" '
+    .session as $s
+    | (.repos[$r] // empty)
+    | ([.active] + (.history // []))[]
+    | select(. != null)
+    | [.id, (.unbound_at // .bound_at // ""), (.title // ""), (.status // ""), ($s[0:8])]
+    | @tsv' "${files[@]}" 2>/dev/null \
+    | sort -t "$(printf '\t')" -k2,2r \
+    | awk -F '\t' '!seen[$1]++' \
+    | head -n "$limit"
+  exit 0
+fi
+
+[ -n "$session" ] || die "no session id — run inside Claude Code or pass --session <id>"
+mkdir -p "$TICKET_STATE_DIR"
+state=$(ticket_state_file "$session")
+[ -f "$state" ] || printf '{"session":"%s","repos":{}}\n' "$session" > "$state"
+
+apply() {
+  # apply <jq filter> [jq args...] — normalise, run the filter, replace the state file atomically.
+  local filter="$1"; shift
+  local tmp
+  tmp=$(mktemp "$TICKET_STATE_DIR/.tmp.XXXXXX")
+  jq --arg r "$repo" --arg at "$(now)" --arg session "$session" "$@" \
+    '.session = $session
+     | .repos[$r] = (.repos[$r] // {active: null, history: [], exempt: null})
+     | .updated_at = $at
+     | '"$filter" "$state" > "$tmp" || { rm -f "$tmp"; die "state update failed"; }
+  mv "$tmp" "$state"
+}
+
+case "$cmd" in
+  bind)
+    id="${1:-}"
+    [ -n "$id" ] || die "usage: ticket bind <ID> [--title T] [--url U] [--status S]"
+    keys=$(ticket_keys_re "$repo")
+    if [ -n "$keys" ] && ! printf '%s' "$id" | grep -Eq "^($keys)-[0-9]+$"; then
+      die "$id does not look like a ticket of this repo's team(s): $keys"
+    fi
+    apply '
+      .repos[$r].active as $old
+      | (if $old != null and $old.id != $id then .repos[$r].history += [$old + {unbound_at: $at}] else . end)
+      | .repos[$r].active = {
+          id: $id,
+          title: (if $title != "" then $title elif ($old.id // "") == $id then ($old.title // "") else "" end),
+          url: (if $url != "" then $url elif ($old.id // "") == $id then ($old.url // "") else "" end),
+          status: (if $status != "" then $status elif ($old.id // "") == $id then ($old.status // "") else "" end),
+          bound_at: (if ($old.id // "") == $id then $old.bound_at else $at end)
+        }
+      | .repos[$r].exempt = null' \
+      --arg id "$id" --arg title "$title" --arg url "$url" --arg status "$status"
+    printf 'bound %s to this session in %s\n' "$id" "$repo"
+    ;;
+  status)
+    s="${1:-$status}"
+    [ -n "$s" ] || die "usage: ticket status <status>"
+    [ "$(ticket_binding_kind "$session" "$repo")" = active ] || die "no active ticket in $repo"
+    apply '.repos[$r].active.status = $s' --arg s "$s"
+    printf '%s\n' "$(ticket_active_line "$session" "$repo")"
+    ;;
+  exempt)
+    reason="${*:-no reason given}"
+    apply '
+      (if .repos[$r].active != null then .repos[$r].history += [.repos[$r].active + {unbound_at: $at}] else . end)
+      | .repos[$r].active = null
+      | .repos[$r].exempt = {reason: $reason, at: $at}' --arg reason "$reason"
+    printf 'session exempt from the edit gate in %s (commits still need a ticket ID)\n' "$repo"
+    ;;
+  unbind)
+    apply '
+      (if .repos[$r].active != null then .repos[$r].history += [.repos[$r].active + {unbound_at: $at}] else . end)
+      | .repos[$r].active = null'
+    printf 'no active ticket in %s\n' "$repo"
+    ;;
+  show)
+    if [ "$json" = 1 ]; then
+      jq --arg r "$repo" '.repos[$r] // {active: null, history: [], exempt: null}' "$state"
+      exit 0
+    fi
+    jq -r --arg r "$repo" '
+      (.repos[$r] // {}) as $b
+      | "repo:    \($r)",
+        "active:  " + (if $b.active then "\($b.active.id) — \($b.active.title // "") [\($b.active.status // "")] \($b.active.url // "")" else "none" end),
+        "exempt:  " + (if $b.exempt then "yes — \($b.exempt.reason)" else "no" end),
+        "history: " + ((($b.history // []) | map(.id) | unique | join(", ")) as $h | if $h == "" then "none" else $h end)' "$state"
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac

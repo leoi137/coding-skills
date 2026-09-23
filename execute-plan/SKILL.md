@@ -17,6 +17,7 @@ Goal: turn an approved plan into working, locally-verified code with **tight fee
 - Read the whole plan first. Ambiguous but safe → state the assumption, proceed. Ambiguous in a way that changes behavior / architecture / data / contracts / security / scope → ask one consolidated question, wait.
 - **Drift check (read-only):** compare the plan's `Snapshot` sha to current HEAD. Moved? Spot-check the plan's cited symbols still exist; if the plan is materially stale, stop and flag rather than coding against it.
 - **Session board (contract §Session board):** read `plans/SESSIONS.md`, then set this plan's section to `Stage: execute` and claim the plan's `## Files`. Another plan claims an overlapping file → stop and surface before touching it.
+- **Ticket (repos with `.claude/linear.json`):** the plan's `## Snapshot` names `ticket: <ID>` → bind it before the first edit (`~/.claude/skills/ticket/bin/ticket bind <ID> …`, then move it to the started status per the `ticket` skill), with no question. It names none → resolve one through the `ticket` skill first (the gate would stop the first edit anyway).
 - Set `Status: In progress` when you start.
 
 ## Resume — fresh session, partially-ticked plan

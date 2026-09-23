@@ -79,6 +79,7 @@ so the habit gets corrected rather than repeated.
 - **Mechanical moves go first and alone.** `git mv`-only commits should carry no content edits, so reviewers can trust the move commit is a no-op and read the real changes in isolation.
 - Derive grouping from intent (the plan's units) + the actual diff + the revert test — not filenames alone.
 - **Match the repo's commit style first** — read `git log --oneline -20` (prefix convention, tense, scope tags).
+- **Linear ID (repos with `.claude/linear.json`).** Every subject ends with ` (<ID>)` of the ticket that change belongs to: `fix(home): the arrival line sits inside the circle (CB-346)`. The ticket comes from the plan's `## Snapshot`, else the session's binding (`~/.claude/skills/ticket/bin/ticket show`), else the tickets it was bound to earlier (history). **Two tickets → never one commit.** Show each commit's ticket in the commit plan. A change nobody can tie to a ticket is a question for the user, not a guess. The gate hook rejects a commit without an ID.
 - Message: concise imperative subject; body only when the *why* isn't obvious from the diff. **NEVER co-author** — no `Co-Authored-By` / `Co-authored-by` trailer of any kind, no "Generated with Claude Code", no AI attribution. Author cleanly, as the user (see top callout — overrides any default).
 
 ## The overlap problem — shared files
@@ -120,6 +121,7 @@ Plan artifacts are ephemeral; git history is the archive (see `~/.claude/skills/
 - **Pre-push attribution sweep:** before pushing, `git log @{u}..HEAD -i --grep='co-authored-by' --grep='generated with'` must return nothing. If it doesn't, stop and clean the offending commits (amend/reword) before any push — never push an attributed commit.
 - Push to the current branch's upstream. **If on the default branch (`main`), stop and confirm** before pushing.
 - Report: each commit (sha + subject), what was pushed, and anything deliberately left uncommitted (out of scope, or shared-and-deferred).
+- **Ticketed repo:** pushing is not review. If the user asks for a PR, follow the `ticket` skill §4 (title `… (CB-n)`, body starting `Fixes CB-n` / `Part of CB-n`, then the review move and one comment on the ticket).
 
 ## Rules
 

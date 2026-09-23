@@ -31,6 +31,8 @@ Goal: turn a research brief (or a clear ask) into an **ordered, verifiable, file
    - **Don't add `(Review checkpoint)` markers.** `/execute-plan` runs every phase straight through to completion; there is no mid-plan pause to plan around. Review happens once at the end via `/review-plan`.
    - **Publish the `## Files` list to the session board** (contract §Session board) as this plan's claims, `Stage: write` — the earliest conflict signal other sessions get. If the claims overlap another plan's, name the collision in `## Open questions` (blocking if the same symbols) instead of proceeding silently.
 
+   - **Ticket (repos with `.claude/linear.json`).** Resolve the plan's Linear ticket through the `ticket` skill (continue an existing one or create one; the user answers once) and record it on the `## Snapshot` line as `ticket: CB-123`. The plan's Goal and Acceptance criteria should match the ticket's. If they diverge, say so in the hand-back.
+
 5. **Resolve blocking decisions.** A safe, convention-consistent default → state it as an explicit assumption and proceed. No safe default → leave `Status: Blocked` and name the exact decision. Don't mark `Ready` while a blocking question remains.
 
 6. **Hand back to the user.** The TODO is the only file you create. Show goal + acceptance criteria + checklist + any blocking questions, and ask for approval before `/execute-plan`. This is the pre-code gate — the cheapest place to catch a wrong plan.

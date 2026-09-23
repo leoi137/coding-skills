@@ -45,6 +45,17 @@ Protocol — every stage, right after reading this contract:
 
 The board is coordination state, not documentation: it records *intent and ownership*, nothing else. The TODO stays the source of truth for progress; the board only answers "who is touching what, right now."
 
+## Linear ticket — repos with `.claude/linear.json`
+
+In a ticketed repo every plan belongs to one Linear ticket, and the `ticket` skill (`~/.claude/skills/ticket/SKILL.md`) owns the Linear side. Its hooks enforce it: no edit without a ticket bound to the session, and no commit or PR without the ID.
+
+- `/write-plan` resolves the ticket, existing or new, and records it on the `## Snapshot` line (`ticket: CB-123`). Writing the plan is the commitment.
+- `/execute-plan` binds the plan's ticket at start (`ticket bind`), with no question.
+- `/commit-push` ends every commit subject with ` (<ID>)` and never mixes two tickets in one commit.
+- Research is pre-commitment. `research/` and the session board are exempt from the gate.
+
+Repos without the config: ignore this section.
+
 ## Artifact locations & naming
 
 Defaults — a repo's CLAUDE.md may override, but there is exactly **one home per artifact type per repo**:
@@ -63,7 +74,7 @@ Never write a pipeline artifact anywhere else — not the repo root, not a subpr
 ```markdown
 # <Feature> — Implementation Plan
 ## Status — Ready | Blocked | In progress | Done
-## Snapshot — branch@sha · research: research/RESEARCH_<feature>.md (or "none")
+## Snapshot — branch@sha · research: research/RESEARCH_<feature>.md (or "none") · ticket: <ID> (or "none")
 ## Goal — one sentence, observable from outside
 ## Acceptance criteria
 - [ ] <observable behavior>

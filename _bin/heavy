@@ -1,0 +1,364 @@
+#!/usr/bin/env bash
+# heavy — machine-wide slots for RAM-heavy commands, so parallel sessions and subagents on a 16 GB
+# Mac queue instead of thrashing.
+#
+#   heavy <slot[,slot…]> [--wait-max SEC] [--session ID] -- <cmd> [args…]
+#   heavy <slot[,slot…]> [--wait-max SEC] [--session ID] --sh '<shell command>'
+#   heavy status                      held slots, owners, memory, load
+#   heavy classify '<shell command>'  slots a command needs (empty = not heavy); used by the hook
+#
+# Slots: tsc · test · docker · build — one holder each. `build` also takes `tsc` (next build runs tsc).
+# Slots are taken in a fixed order (all or nothing), then held while waiting for memory admission:
+# memory pressure not critical, and either pressure normal or ≥ HEAVY_MIN_FREE_MB free, and load1 <
+# HEAVY_MAX_LOAD. Admission waits at most HEAVY_ADMIT_MAX seconds, then runs with a logged warning —
+# the slots already serialize the work, and a queue that never drains wedges every session.
+#
+# --wait-max SEC: give up waiting for a slot after SEC seconds with exit 75 (EX_TEMPFAIL) and the
+# owner on stderr. The PreToolUse hook passes 60 for foreground Bash calls (10-minute tool cap).
+#
+# A lock is a directory locks/<slot>.lock holding owner.json {pid, lstart, session, cmd, cwd,
+# started}. A dead owner (pid gone, or pid reused with another start time) is stolen atomically
+# (mv aside, then mkdir). The legacy /tmp/claude-ob-heavy.lock is honoured as holding every slot.
+#
+# LANES_OFF=1 runs the command directly. Every decision is appended to $LANES_HOME/heavy.log.
+set -uo pipefail
+
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/lib/common.sh" || exit 1
+
+HEAVY_MIN_FREE_MB="${HEAVY_MIN_FREE_MB:-3072}"
+HEAVY_MAX_LOAD="${HEAVY_MAX_LOAD:-10}"
+HEAVY_ADMIT_MAX="${HEAVY_ADMIT_MAX:-600}"
+LOCKS="$LANES_HOME/locks"
+LOG="$LANES_HOME/heavy.log"
+LEGACY_LOCK=/tmp/claude-ob-heavy.lock
+SLOT_ORDER="build tsc test docker"
+
+log() {
+  mkdir -p "$LANES_HOME"
+  printf '%s\t%s\tpid=%s\tsession=%s\tfree=%s\tpressure=%s\tload=%s\t%s\n' \
+    "$(lanes_now)" "$1" "$$" "${SESSION:-}" "$(lanes_free_mb)" "$(pressure)" "$(lanes_load1)" "${2:-}" >> "$LOG" 2>/dev/null
+}
+
+# 1 normal · 2 warn · 4 critical
+pressure() { sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null || echo 1; }
+
+lstart_of() { ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//'; }
+
+# --- classify --------------------------------------------------------------------------------
+
+# Slots needed by one command segment (already split on && || ; | and parens).
+classify_segment() {
+  local s="$1" tool rest script w words
+  # strip leading env assignments and transparent prefixes
+  s=$(printf '%s' "$s" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+  while :; do
+    if printf '%s' "$s" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]'; then
+      s="${s#* }"; s=$(printf '%s' "$s" | sed -E 's/^[[:space:]]+//'); continue
+    fi
+    case "$s" in
+      "env "*|"time "*|"nice "*|"command "*|"exec "*|"nohup "*) s="${s#* }" ;;
+      *) break ;;
+    esac
+    s=$(printf '%s' "$s" | sed -E 's/^[[:space:]]+//')
+  done
+  [ -n "$s" ] || return 0
+
+  # pnpm / npm / npx front-ends → underlying tool or script
+  script=""
+  case "$s" in
+    pnpm\ *|npm\ *|yarn\ *|npx\ *|bunx\ *)
+      # drop the runner and its option flags (with their values) up to the subcommand
+      s=$(printf '%s' "$s" | sed -E 's/^(pnpm|npm|yarn|npx|bunx)[[:space:]]+//')
+      while :; do
+        case "$s" in
+          --filter\ *|-F\ *|--dir\ *|-C\ *|--prefix\ *|--workspace\ *|-w\ *)
+            s=$(printf '%s' "$s" | sed -E 's/^[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]*//') ;;
+          --filter=*|--dir=*|--workspace=*|-r\ *|--recursive\ *|-s\ *|--silent\ *|--if-present\ *|-y\ *|--yes\ *|--parallel\ *|--stream\ *)
+            s=$(printf '%s' "$s" | sed -E 's/^[^[:space:]]+[[:space:]]*//') ;;
+          *) break ;;
+        esac
+      done
+      case "$s" in
+        exec\ *|dlx\ *) s="${s#* }" ;;
+        run\ *) script=$(printf '%s' "${s#run }" | awk '{print $1}'); rest="${s#run }"; rest="${rest#"$script"}" ;;
+        install*|i\ *|add\ *|remove\ *|why\ *|ls*|list*|outdated*|update*|store\ *|config\ *|view\ *|info\ *) return 0 ;;
+        *)
+          # `pnpm test`, `pnpm typecheck`… — a bare word that is not a known binary is a script
+          w=$(printf '%s' "$s" | awk '{print $1}')
+          case "$w" in
+            tsc|turbo|vitest|jest|next|eslint|tsx|node) ;;
+            *) script="$w"; rest="${s#"$w"}" ;;
+          esac ;;
+      esac ;;
+  esac
+
+  if [ -n "$script" ]; then
+    case "$script" in
+      test:integration*|*:integration) echo docker; return ;;
+      test:discovery|format*|theme:check|check:*|lint:fix|lint-staged) return 0 ;;
+      typecheck*|type-check*|tsc*|lint|lint:*) echo tsc; return ;;
+      build*) echo build; return ;;
+      test|test:*)
+        has_file_arg "$rest" && return 0
+        echo test; return ;;
+      *) return 0 ;;
+    esac
+  fi
+
+  tool=$(printf '%s' "$s" | awk '{print $1}'); tool="${tool##*/}"
+  rest="${s#*"$tool"}"
+  case "$tool" in
+    tsc)
+      case "$rest" in *--version*|*" -v"*|*--help*|*--showConfig*) return 0 ;; esac
+      echo tsc ;;
+    turbo)
+      case "$rest" in *--dry*|*" ls"*|*--version*|*" prune"*|*" login"*|*" link"*) return 0 ;; esac
+      words=""
+      case "$rest" in *typecheck*|*lint*) words="$words tsc" ;; esac
+      case "$rest" in *test:integration*) words="$words docker" ;; esac
+      case "$rest" in *"test "*|*"test") words="$words test" ;; esac
+      case "$rest" in *build*) words="$words build" ;; esac
+      for w in $words; do echo "$w"; done ;;
+    next)
+      case "$rest" in " build"*) echo build ;; esac ;;
+    vitest)
+      case "$rest" in *integration*) echo docker; return ;; esac
+      case "$rest" in *related*|*--version*|*" list"*) return 0 ;; esac
+      has_file_arg "$rest" && return 0
+      echo test ;;
+    jest)
+      case "$rest" in *--findRelatedTests*|*--listTests*|*--version*) return 0 ;; esac
+      has_file_arg "$rest" && return 0
+      echo test ;;
+    eslint)
+      has_src_arg "$rest" && return 0
+      echo tsc ;;
+  esac
+}
+
+# Does the argument string name a specific test/source file (a targeted, cheap run)?
+has_file_arg() {
+  local a
+  local skip=0
+  for a in $1; do
+    if [ $skip = 1 ]; then skip=0; continue; fi
+    case "$a" in
+      -c|--config|--project|-p|--root|--dir) skip=1 ;;
+      -*|run|watch|--|*config.*) ;;
+      *.test.*|*.spec.*|*/*.ts|*/*.tsx|*/*.js|*/*.mjs|*/*.mts|*.ts|*.tsx) return 0 ;;
+    esac
+  done
+  return 1
+}
+has_src_arg() {
+  local a
+  for a in $1; do
+    case "$a" in -*) ;; *.ts|*.tsx|*.js|*.jsx|*.mjs|*.cjs|*.mts) return 0 ;; esac
+  done
+  return 1
+}
+
+classify() {
+  local cmd="$1" seg out=""
+  case "$cmd" in *LANES_OFF=1*) return 0 ;; esac
+  # already wrapped, or a toolkit script that takes its own slots
+  printf '%s' "$cmd" | grep -Eq '(_bin/|^|[;&|(][[:space:]]*)(heavy|gate)[[:space:]"]' && return 0
+  # split on control operators and subshell parens; drop quoted strings so `echo "pnpm test"` stays light
+  out=$(printf '%s\n' "$cmd" \
+    | sed -E "s/'[^']*'/''/g; s/\"[^\"]*\"/\"\"/g" \
+    | sed -E 's/(&&|\|\||;|\||\(|\)|`)/\
+/g' \
+    | while IFS= read -r seg; do classify_segment "$seg"; done)
+  [ -n "$out" ] || return 0
+  # build implies tsc; print in lock order
+  case " $(echo $out) " in *" build "*) out="$out
+tsc" ;; esac
+  for seg in $SLOT_ORDER; do
+    printf '%s\n' "$out" | grep -qx "$seg" && printf '%s\n' "$seg"
+  done | paste -sd, -
+}
+
+# --- locks -----------------------------------------------------------------------------------
+
+lock_dir() { printf '%s/%s.lock' "$LOCKS" "$1"; }
+
+owner_alive() {
+  local d="$1" pid ls now mt
+  if [ ! -f "$d/owner.json" ]; then
+    # between mkdir and the owner write; give it a few seconds
+    now=$(lanes_epoch); mt=$(stat -f %m "$d" 2>/dev/null || echo 0)
+    [ $((now - mt)) -lt 10 ]
+    return
+  fi
+  pid=$(jq -r '.pid // empty' "$d/owner.json" 2>/dev/null)
+  ls=$(jq -r '.lstart // empty' "$d/owner.json" 2>/dev/null)
+  lanes_pid_alive "$pid" || return 1
+  [ -z "$ls" ] || [ "$(lstart_of "$pid")" = "$ls" ]
+}
+
+owner_line() {
+  local d="$1"
+  [ -f "$d/owner.json" ] || { echo "(starting)"; return; }
+  jq -r --arg now "$(lanes_epoch)" '"pid \(.pid) session \((.session // "?")[0:8]) for \(($now|tonumber) - (.startedEpoch // ($now|tonumber)))s: \(.cmd[0:120])"' "$d/owner.json" 2>/dev/null
+}
+
+# Try to take one slot now. 0 = taken, 1 = held by a live owner.
+try_slot() {
+  local slot="$1" d aside
+  d=$(lock_dir "$slot")
+  mkdir -p "$LOCKS"
+  if mkdir "$d" 2>/dev/null; then
+    jq -n --arg pid "$$" --arg ls "$(lstart_of $$)" --arg s "${SESSION:-}" --arg c "$CMD_DESC" \
+      --arg cwd "$PWD" --arg t "$(lanes_now)" --arg e "$(lanes_epoch)" --arg slots "$SLOTS" \
+      '{pid: ($pid|tonumber), lstart: $ls, session: $s, cmd: $c, cwd: $cwd, slots: $slots, started: $t, startedEpoch: ($e|tonumber)}' \
+      | lanes_write "$d/owner.json"
+    return 0
+  fi
+  owner_alive "$d" && return 1
+  # stale: move it aside atomically; only one stealer wins the mv
+  aside="$d.stale.$$.$(lanes_epoch)"
+  if mv "$d" "$aside" 2>/dev/null; then
+    log steal "slot=$slot was=$(jq -c . "$aside/owner.json" 2>/dev/null)"
+    rm -rf "$aside"
+    [ "${2:-}" = retried ] || { try_slot "$slot" retried; return; }
+  fi
+  return 1
+}
+
+HELD=""
+release_all() {
+  local slot d
+  for slot in $HELD; do
+    d=$(lock_dir "$slot")
+    # only remove a lock we still own
+    if [ "$(jq -r '.pid // empty' "$d/owner.json" 2>/dev/null)" = "$$" ]; then rm -rf "$d"; fi
+  done
+  HELD=""
+}
+
+# Take every slot or none.
+try_all() {
+  local slot
+  HELD=""
+  if [ -d "$LEGACY_LOCK" ]; then BLOCKER="legacy lock $LEGACY_LOCK"; return 1; fi
+  for slot in $SLOT_ORDER; do
+    case ",$SLOTS," in *",$slot,"*) ;; *) continue ;; esac
+    if try_slot "$slot"; then
+      HELD="$HELD $slot"
+    else
+      BLOCKER="$slot: $(owner_line "$(lock_dir "$slot")")"
+      release_all
+      return 1
+    fi
+  done
+  return 0
+}
+
+admitted() {
+  local p free load
+  p=$(pressure); free=$(lanes_free_mb); load=$(lanes_load1)
+  [ "$p" -ge 4 ] && return 1
+  [ "$load" -lt "$HEAVY_MAX_LOAD" ] || return 1
+  [ "$p" -le 1 ] || [ "$free" -ge "$HEAVY_MIN_FREE_MB" ]
+}
+
+cmd_status() {
+  local slot d any=0
+  printf 'memory: %s MB reclaimable, pressure %s (1 normal, 2 warn, 4 critical), load1 %s\n' \
+    "$(lanes_free_mb)" "$(pressure)" "$(lanes_load1)"
+  [ -d "$LEGACY_LOCK" ] && { echo "legacy lock held: $LEGACY_LOCK (all slots)"; any=1; }
+  for slot in $SLOT_ORDER; do
+    d=$(lock_dir "$slot")
+    [ -d "$d" ] || continue
+    any=1
+    if owner_alive "$d"; then printf '%-6s held by %s\n' "$slot" "$(owner_line "$d")"
+    else printf '%-6s STALE %s\n' "$slot" "$(owner_line "$d")"; fi
+  done
+  [ $any = 1 ] || echo "all slots free"
+}
+
+# --- main ------------------------------------------------------------------------------------
+
+case "${1:-}" in
+  status) cmd_status; exit 0 ;;
+  classify) shift; classify "${1:-}"; exit 0 ;;
+  ""|-h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+esac
+
+SLOTS="$1"; shift
+for s in $(printf '%s' "$SLOTS" | tr ',' ' '); do
+  case " $SLOT_ORDER " in *" $s "*) ;; *) lanes_die "unknown slot '$s' (slots: $SLOT_ORDER)" ;; esac
+done
+case ",$SLOTS," in *,build,*) case ",$SLOTS," in *,tsc,*) ;; *) SLOTS="$SLOTS,tsc" ;; esac ;; esac
+
+WAIT_MAX=0; SESSION="${HEAVY_SESSION:-${CLAUDE_CODE_SESSION_ID:-}}"; SH=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --wait-max) WAIT_MAX="$2"; shift 2 ;;
+    --session) SESSION="$2"; shift 2 ;;
+    --sh) SH="$2"; shift 2; break ;;
+    --) shift; break ;;
+    *) lanes_die "unexpected '$1' (use -- before the command)" ;;
+  esac
+done
+if [ -n "$SH" ]; then CMD_DESC="$SH"; else CMD_DESC="$*"; fi
+[ -n "$CMD_DESC" ] || lanes_die "no command"
+
+run() {
+  if [ -n "$SH" ]; then "${SHELL:-/bin/bash}" -c "$SH"; else "$@"; fi
+}
+
+if [ "${LANES_OFF:-}" = 1 ]; then run "$@"; exit $?; fi
+
+# The command runs as a background child that we `wait` on: bash defers traps while a foreground
+# child runs, so a TERM from a tool timeout would otherwise keep the slot until the child finished.
+CHILD=""
+kill_tree() {
+  local c
+  for c in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$c"; done
+  kill -TERM "$1" 2>/dev/null
+}
+on_signal() {
+  [ -n "$CHILD" ] && kill_tree "$CHILD"
+  release_all
+  exit "$1"
+}
+trap 'release_all' EXIT
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM HUP
+
+start=$(lanes_epoch); BLOCKER=""; announced=0
+until try_all; do
+  waited=$(( $(lanes_epoch) - start ))
+  if [ "$WAIT_MAX" -gt 0 ] && [ "$waited" -ge "$WAIT_MAX" ]; then
+    log busy "slots=$SLOTS blocker=$BLOCKER cmd=${CMD_DESC:0:200}"
+    printf 'heavy: busy after %ss — %s\nRerun this command with run_in_background: true; it will queue for the slot.\n' "$waited" "$BLOCKER" >&2
+    exit 75
+  fi
+  if [ $announced = 0 ]; then printf 'heavy: waiting for %s — %s\n' "$SLOTS" "$BLOCKER" >&2; announced=1; log wait "slots=$SLOTS blocker=$BLOCKER"; fi
+  sleep 2
+done
+
+astart=$(lanes_epoch); warned=0
+until admitted; do
+  if [ $(( $(lanes_epoch) - astart )) -ge "$HEAVY_ADMIT_MAX" ]; then
+    log admit-timeout "slots=$SLOTS proceeding"
+    printf 'heavy: memory still tight after %ss; running anyway (slots held)\n' "$HEAVY_ADMIT_MAX" >&2
+    break
+  fi
+  if [ $warned = 0 ]; then
+    printf 'heavy: holding %s, waiting for memory (%s MB free, pressure %s, load %s)\n' "$SLOTS" "$(lanes_free_mb)" "$(pressure)" "$(lanes_load1)" >&2
+    log admit-wait "slots=$SLOTS"; warned=1
+  fi
+  sleep 5
+done
+
+log acquire "slots=$SLOTS waited=$(( $(lanes_epoch) - start ))s cmd=${CMD_DESC:0:200}"
+if [ -n "$SH" ]; then "${SHELL:-/bin/bash}" -c "$SH" <&0 & else "$@" <&0 & fi
+CHILD=$!
+wait "$CHILD"
+rc=$?
+CHILD=""
+log release "slots=$SLOTS rc=$rc ran=$(( $(lanes_epoch) - astart ))s"
+release_all
+exit $rc

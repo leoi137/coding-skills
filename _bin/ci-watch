@@ -1,0 +1,307 @@
+#!/bin/bash
+# ci-watch <pr> [--timeout-min 45] [--interval 30] [--base <sha>]
+# ci-watch --run <runId> [--timeout-min 45] [--interval 30] [--base <sha>]
+#
+# Meant for run_in_background. Polls `gh pr checks <pr>` (or `gh run view <runId>` with --run, which
+# also replays any finished workflow run) until every check is terminal or the timeout passes, then
+# classifies each failure. Silent while waiting except one stderr line when the pass/fail/pending
+# picture changes.
+#
+# A PR's checks are only accepted as terminal when every GitHub Actions run they link to was built
+# from the PR's current head sha — right after a push, `gh pr checks` still shows the previous head's
+# finished checks for a while, and reading those would report a stale verdict.
+#
+# Classification of each signature (ci-sigs) of each failed check, first match wins:
+#   inherited      the signature is in main-health's failing list (main is red with it right now)
+#   fixed-on-main  its file exists and `git log <base>..origin/main -- <file>` is non-empty, where
+#                  base = --base or `git merge-base origin/main HEAD`. Without --base this needs the
+#                  cwd to be a checkout of the PR's branch (skipped otherwise); with --base any
+#                  checkout of the repo will do.
+#   flaky          in $LANES_HOME/flaky.json, kind env, or a test signature whose failure block held
+#                  an env marker (ci-sigs puts that test file in the env signature's detail)
+#   ours           everything else, including failed checks with no usable log: check|<name>|no-log
+#                  (non-Actions check, e.g. Vercel), check|<name>|log-unavailable, check|<name>|no-signature
+# `task|…`/`step|…` signatures are marked derived and take the most severe class among the job's
+# other signatures (ours > fixed-on-main > inherited > flaky); counts skip derived rows.
+#
+# stdout: {pr, state: green|red|timeout|unknown, checks:[{name,bucket,link}],
+#          failures:[{check, jobId, sig, class, derived?}], counts:{ours,inherited,fixedOnMain,flaky},
+#          base, main:{state,runId}, finishedAt}
+# stderr: a short human summary.
+# Exit: 0 green, 1 at least one `ours`, 2 red but only inherited/flaky/fixed-on-main, 3 timeout, 4 error.
+# Side effect: a registry record in $LANES_HOME/registry/*.json with .pr == <pr> gets
+#   .ci = {state, failing:[ours signatures], counts, checkedAt} (never creates records).
+set -uo pipefail
+. "$(cd "$(dirname "$0")" && pwd -P)/lib/common.sh"
+lanes_need jq gh git
+
+usage() { sed -n '2,3p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 4; }
+
+PR="" RUN="" TIMEOUT_MIN=45 INTERVAL=30 BASE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --timeout-min) TIMEOUT_MIN="${2:-}"; shift 2 ;;
+    --interval) INTERVAL="${2:-}"; shift 2 ;;
+    --base) BASE="${2:-}"; shift 2 ;;
+    --run) RUN="${2:-}"; shift 2 ;;
+    -h|--help) usage ;;
+    -*) lanes_warn "unknown option $1"; usage ;;
+    *) [ -z "$PR" ] && PR="${1#\#}" || usage; shift ;;
+  esac
+done
+case "$TIMEOUT_MIN$INTERVAL" in *[!0-9]*|"") lanes_warn "--timeout-min/--interval take whole numbers"; usage ;; esac
+[ "$INTERVAL" -ge 5 ] || INTERVAL=5
+if [ -n "$RUN" ]; then case "$RUN" in *[!0-9]*) usage ;; esac
+else case "$PR" in ""|*[!0-9]*) usage ;; esac
+fi
+
+SIGS="$LANES_BIN/ci-sigs"
+FLAKY="$LANES_HOME/flaky.json"
+TMPD=$(mktemp -d "${TMPDIR:-/tmp}/ci-watch.XXXXXX") || exit 4
+trap 'rm -rf "$TMPD"' EXIT
+LABEL=$([ -n "$RUN" ] && echo "run $RUN" || echo "PR $PR")
+
+say() { printf 'ci-watch: %s\n' "$*" >&2; }
+
+# _to <secs> cmd… — hard timeout (macOS has no timeout(1); gh ignores SIGALRM, so a perl parent
+# forks, waits, and kills the child's process group on expiry). Exit 124 on timeout.
+_to() {
+  perl -e '
+    use POSIX ();
+    my $t = shift; my $pid = fork; exit 127 unless defined $pid;
+    if ($pid == 0) { setpgrp(0, 0); exec @ARGV or exit 127 }
+    my $kill = sub { kill "TERM", -$pid;
+      for (1 .. 20) { last if waitpid($pid, POSIX::WNOHANG()) > 0; select(undef, undef, undef, 0.1) }
+      kill "KILL", -$pid; waitpid($pid, 0); };
+    $SIG{ALRM} = sub { $kill->(); exit 124 };
+    $SIG{INT} = $SIG{TERM} = $SIG{HUP} = sub { $kill->(); exit 130 };
+    alarm $t; waitpid($pid, 0); alarm 0;
+    exit($? & 127 ? 128 + ($? & 127) : $? >> 8);
+  ' "$@"
+}
+
+# ---- fetch the check list as [{name,state,bucket,link,workflow}] (empty array = nothing reported yet)
+fetch_checks() {
+  local out err rc
+  if [ -n "$RUN" ]; then
+    out=$(_to 30 gh run view "$RUN" -R "$LANES_REPO_SLUG" --json jobs,status,conclusion,headSha,headBranch,workflowName,url 2>"$TMPD/err")
+    rc=$?
+    [ $rc -eq 0 ] || { ERR=$(head -c 300 "$TMPD/err"); return 1; }
+    printf '%s' "$out" > "$TMPD/run.json"
+    printf '%s' "$out" | jq -c '. as $r | [.jobs[] | {name, state: ((.conclusion // .status) | ascii_upcase),
+      bucket: (if .status != "completed" then "pending"
+               elif .conclusion == "success" then "pass"
+               elif (.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "startup_failure") then "fail"
+               elif .conclusion == "cancelled" then "cancel"
+               elif (.conclusion == "skipped" or .conclusion == "neutral") then "skipping"
+               else "fail" end),
+      link: .url, workflow: $r.workflowName}]'
+    return 0
+  fi
+  out=$(_to 30 gh pr checks "$PR" -R "$LANES_REPO_SLUG" --json name,state,bucket,link,workflow 2>"$TMPD/err")
+  rc=$?
+  err=$(head -c 300 "$TMPD/err")
+  if printf '%s' "$out" | jq -e 'type == "array"' >/dev/null 2>&1; then printf '%s' "$out"; return 0; fi
+  case "$err" in *"no checks reported"*) echo '[]'; return 0 ;; esac
+  ERR="${err:-gh pr checks exited $rc}"
+  case "$err" in *"Could not resolve to a PullRequest"*|*"no pull requests found"*) FATAL=1 ;; esac
+  return 1
+}
+
+# Are the checks built from the PR's current head? (1-2 API calls; only asked once checks look terminal)
+checks_current() {
+  local head ids id sha
+  [ -n "$RUN" ] && return 0
+  head=$(_to 30 gh pr view "$PR" -R "$LANES_REPO_SLUG" --json headRefOid --jq .headRefOid 2>/dev/null) || return 0
+  [ -n "$head" ] || return 0
+  HEAD_SHA="$head"
+  ids=$(printf "%s" "$1" | jq -r '.[] | (.link // "") | select(test("/actions/runs/[0-9]+")) | capture("/actions/runs/(?<r>[0-9]+)").r' | sort -u)
+  for id in $ids; do
+    sha=$(_to 30 gh api "repos/$LANES_REPO_SLUG/actions/runs/$id" --jq .head_sha 2>/dev/null) || continue
+    [ -z "$sha" ] || [ "$sha" = "$head" ] || return 1
+  done
+  return 0
+}
+
+# ---- poll
+start=$(lanes_epoch)
+deadline=$((start + TIMEOUT_MIN * 60))
+state="" checks='[]' last_key="" polled_ok=0 ERR="" FATAL=0 HEAD_SHA="" stale_said=""
+while :; do
+  if fetch_checks > "$TMPD/checks.json"; then
+    polled_ok=1; checks=$(cat "$TMPD/checks.json")
+    pend=$(printf '%s' "$checks" | jq '[.[] | select(.bucket == "pending")] | length')
+    total=$(printf '%s' "$checks" | jq 'length')
+    gha=$(printf '%s' "$checks" | jq '[.[] | select((.workflow // "") != "")] | length')
+    key=$(printf '%s' "$checks" | jq -r '"\(length) checks: \([.[] | select(.bucket == "pending")] | length) pending, \([.[] | select(.bucket == "pass")] | length) pass, \([.[] | select(.bucket == "fail")] | length) fail" + ([.[] | select(.bucket == "fail") | .name] | if length > 0 then " (" + join(", ") + ")" else "" end)')
+    if [ "$total" -gt 0 ] && [ "$pend" -eq 0 ] && [ "$gha" -gt 0 ]; then
+      if checks_current "$checks"; then break; fi
+      [ -n "$stale_said" ] || { say "$LABEL: checks still belong to an older head; waiting for ${HEAD_SHA:0:7}"; stale_said=1; }
+      key="stale"
+    fi
+    [ "$key" = "$last_key" ] || { [ "$key" = stale ] || say "$LABEL: $key"; last_key="$key"; }
+  else
+    [ "$FATAL" = 1 ] && { state=unknown; say "$LABEL: $ERR"; break; }
+    [ -n "$ERR" ] && [ "$ERR" != "${last_err:-}" ] && { say "$LABEL: poll failed: $ERR (retrying)"; last_err="$ERR"; }
+  fi
+  now=$(lanes_epoch)
+  if [ "$now" -ge "$deadline" ]; then
+    if [ "$polled_ok" = 1 ]; then state=timeout; else state=unknown; fi
+    break
+  fi
+  # the last sleep is shortened so the final poll lands on the deadline
+  nap=$INTERVAL; [ $((now + nap)) -gt "$deadline" ] && nap=$((deadline - now))
+  sleep "$nap"
+done
+
+if [ -z "$state" ]; then
+  if printf '%s' "$checks" | jq -e 'any(.[]; .bucket == "fail")' >/dev/null; then state=red; else state=green; fi
+fi
+
+# ---- classify failed checks (also on timeout, for whatever already failed)
+failures='[]' MAIN='null' base_used=""
+nfail=$(printf '%s' "$checks" | jq '[.[] | select(.bucket == "fail")] | length')
+if [ "$nfail" -gt 0 ] && [ "$state" != unknown ]; then
+  # main-health (its own 10-minute TTL decides whether to refresh)
+  mh=$("$LANES_BIN/main-health" --json 2>/dev/null)
+  printf '%s' "$mh" | jq -e .state >/dev/null 2>&1 || mh='{"state":"unknown","failing":[]}'
+  MAIN=$(printf '%s' "$mh" | jq -c '{state, runId}')
+  printf '%s' "$mh" | jq -r '.failing[]?.sig // empty' | sort -u > "$TMPD/main.sigs"
+  if [ -s "$FLAKY" ]; then jq -r '.sigs // {} | keys[]' "$FLAKY" 2>/dev/null | sort -u > "$TMPD/flaky.sigs"; else : > "$TMPD/flaky.sigs"; fi
+
+  # fixed-on-main needs a checkout of this repo, origin/main fresh, and a base
+  top=$(lanes_toplevel)
+  fom=0
+  if [ -n "$top" ] && git -C "$top" remote get-url origin 2>/dev/null | grep -q "${LANES_REPO_SLUG}\(\.git\)\{0,1\}$"; then
+    _to 60 git -C "$top" fetch -q origin main >/dev/null 2>&1 || lanes_warn "git fetch origin main failed; using the local origin/main"
+    if [ -n "$BASE" ]; then
+      git -C "$top" cat-file -e "$BASE^{commit}" 2>/dev/null && { base_used="$BASE"; fom=1; } || lanes_warn "--base $BASE is not a commit here; fixed-on-main skipped"
+    else
+      want=""
+      if [ -n "$RUN" ]; then want=$(jq -r '.headBranch // ""' "$TMPD/run.json" 2>/dev/null)
+      else want=$(_to 30 gh pr view "$PR" -R "$LANES_REPO_SLUG" --json headRefName --jq .headRefName 2>/dev/null); fi
+      cur=$(git -C "$top" rev-parse --abbrev-ref HEAD 2>/dev/null)
+      if [ -n "$want" ] && [ "$cur" = "$want" ]; then
+        base_used=$(git -C "$top" merge-base origin/main HEAD 2>/dev/null) && [ -n "$base_used" ] && fom=1
+      else
+        lanes_warn "cwd is on '${cur:-?}', not the checked branch '${want:-?}'; fixed-on-main skipped (pass --base to force)"
+      fi
+    fi
+  else
+    lanes_warn "cwd is not a checkout of $LANES_REPO_SLUG; fixed-on-main skipped"
+  fi
+
+  printf '%s' "$checks" | jq -r '.[] | select(.bucket == "fail") | [.name, (.link // "")] | @tsv' > "$TMPD/failed.tsv"
+  : > "$TMPD/rows.tsv"
+  while IFS="$(printf '\t')" read -r cname clink; do
+    [ -n "$cname" ] || continue
+    jid=$(printf '%s' "$clink" | sed -n 's#.*/job/\([0-9][0-9]*\).*#\1#p')
+    if [ -z "$jid" ]; then
+      printf "%s\t-\tcheck|%s|no-log\n" "$cname" "$cname" >> "$TMPD/rows.tsv"; continue
+    fi
+    if _to 90 gh api --allow-escape-sequences "repos/$LANES_REPO_SLUG/actions/jobs/$jid/logs" > "$TMPD/job.log" 2>/dev/null </dev/null \
+       && [ -s "$TMPD/job.log" ]; then
+      s=$("$SIGS" "$TMPD/job.log" </dev/null)
+      [ -n "$s" ] || s="check|$cname|no-signature"
+    else
+      lanes_warn "log of job $jid ($cname) unavailable"
+      s="check|$cname|log-unavailable"
+    fi
+    printf '%s\n' "$s" | while IFS= read -r sig; do
+      [ -n "$sig" ] && printf '%s\t%s\t%s\n' "$cname" "$jid" "$sig"
+    done >> "$TMPD/rows.tsv"
+  done < "$TMPD/failed.tsv"
+
+  # class per row
+  : > "$TMPD/classed.tsv"
+  while IFS="$(printf '\t')" read -r cname jid sig; do
+    [ -n "$sig" ] || continue
+    kind=${sig%%|*}; rest=${sig#*|}; scope=${rest%%|*}
+    cls=""
+    case "$kind" in task|step) cls=derived ;; esac
+    if [ -z "$cls" ] && grep -Fxq -- "$sig" "$TMPD/main.sigs"; then cls=inherited; fi
+    if [ -z "$cls" ] && [ "$fom" = 1 ]; then
+      case "$kind" in vitest|jest|nodetest|ts|eslint|prettier|reach|build)
+        if [ -n "$scope" ] && [ "$scope" != "?" ] && { [ -e "$top/$scope" ] || git -C "$top" cat-file -e "origin/main:$scope" 2>/dev/null; } \
+           && [ -n "$(git -C "$top" log -1 --format=%h "$base_used..origin/main" -- "$scope" 2>/dev/null)" ]; then
+          cls=fixed-on-main
+        fi ;;
+      esac
+    fi
+    if [ -z "$cls" ]; then
+      if [ "$kind" = env ] || grep -Fxq -- "$sig" "$TMPD/flaky.sigs"; then cls=flaky
+      else
+        case "$kind" in vitest|jest|nodetest)
+          # env-linked: an env signature from the same job names this test file
+          if awk -F'\t' -v c="$cname" -v j="$jid" -v f="$scope" '$1 == c && $2 == j && index($3, "env|") == 1 { n = split($3, p, "|"); if (p[3] == f) found = 1 } END { exit !found }' "$TMPD/rows.tsv"; then
+            cls=flaky
+          fi ;;
+        esac
+      fi
+    fi
+    [ -n "$cls" ] || cls=ours
+    printf '%s\t%s\t%s\t%s\n' "$cname" "$jid" "$sig" "$cls" >> "$TMPD/classed.tsv"
+  done < "$TMPD/rows.tsv"
+
+  failures=$(jq -R -s -c --rawfile m "$TMPD/main.sigs" --rawfile fl "$TMPD/flaky.sigs" '
+    def sev: {"ours": 3, "fixed-on-main": 2, "inherited": 1, "flaky": 0}[.] // -1;
+    ($m | split("\n") | map(select(length > 0))) as $ms
+    | ($fl | split("\n") | map(select(length > 0))) as $fs
+    | [split("\n")[] | select(length > 0) | split("\t")
+       | {check: .[0], jobId: (if .[1] == "" or .[1] == "-" then null else (.[1] | tonumber) end), sig: .[2], class: .[3]}]
+    | . as $all
+    | map(if .class == "derived" then
+            . as $d
+            | [$all[] | select(.check == $d.check and .jobId == $d.jobId and .class != "derived") | .class] as $sib
+            | if ($sib | length) > 0 then . + {class: ($sib | max_by(sev)), derived: true}
+              elif (.sig | IN($ms[])) then .class = "inherited"
+              elif (.sig | IN($fs[])) then .class = "flaky"
+              else .class = "ours" end
+          else . end)' "$TMPD/classed.tsv")
+fi
+
+counts=$(printf '%s' "$failures" | jq -c '[.[] | select(.derived | not)] as $f
+  | {ours: ([$f[] | select(.class == "ours")] | length), inherited: ([$f[] | select(.class == "inherited")] | length),
+     fixedOnMain: ([$f[] | select(.class == "fixed-on-main")] | length), flaky: ([$f[] | select(.class == "flaky")] | length)}')
+
+finished=$(lanes_now)
+prj=$([ -n "$PR" ] && echo "$PR" || echo null)
+runj=$([ -n "$RUN" ] && echo "$RUN" || echo null)
+result=$(jq -cn --argjson pr "$prj" --argjson run "$runj" --arg s "$state" --argjson c "$checks" --argjson f "$failures" \
+  --argjson n "$counts" --arg base "$base_used" --argjson main "$MAIN" --arg at "$finished" --arg err "$ERR" '
+  {pr:$pr, state:$s, checks:[$c[] | {name, bucket, link}], failures:$f, counts:$n,
+   base:(if $base == "" then null else $base end), main:$main, finishedAt:$at}
+  + (if $run != null then {run:$run} else {} end)
+  + (if $s == "unknown" and $err != "" then {error:$err} else {} end)')
+
+# ---- registry (PR mode only; update, never create)
+if [ -n "$PR" ] && [ -d "$LANES_HOME/registry" ]; then
+  ci=$(printf '%s' "$result" | jq -c '{state, failing:[.failures[] | select(.class == "ours" and (.derived | not)) | .sig] | unique,
+    counts, checkedAt:.finishedAt}')
+  for rf in "$LANES_HOME"/registry/*.json; do
+    [ -f "$rf" ] || continue
+    if jq -e --arg pr "$PR" '(.pr // "" | tostring) == $pr' "$rf" >/dev/null 2>&1; then
+      upd=$(jq --argjson ci "$ci" '.ci = $ci' "$rf" 2>/dev/null) && [ -n "$upd" ] \
+        && printf '%s\n' "$upd" | lanes_write "$rf" || lanes_warn "could not update $rf"
+    fi
+  done
+fi
+
+# ---- human summary (stderr) + JSON (stdout)
+printf '%s' "$result" | jq -r --arg label "$LABEL" '
+  "ci-watch: \($label) \(.state)"
+  + (if .state == "red" or (.failures | length) > 0 then
+       " — \([.checks[] | select(.bucket == "fail")] | length) failing check(s): ours \(.counts.ours), inherited \(.counts.inherited), fixed-on-main \(.counts.fixedOnMain), flaky \(.counts.flaky)"
+     elif .state == "green" then " — \(.checks | length) checks passed" else "" end)
+  + (if .error then " (\(.error))" else "" end),
+  ([.failures[] | select(.derived | not)] | .[0:12][] | "  \(.class | . + "            " | .[0:13]) \(.check): \(.sig | .[0:160])"),
+  (if ([.failures[] | select(.derived | not)] | length) > 12 then "  … \(([.failures[] | select(.derived | not)] | length) - 12) more" else empty end)' >&2
+printf '%s\n' "$result" | jq .
+
+case "$state" in
+  green) exit 0 ;;
+  timeout) exit 3 ;;
+  unknown) exit 4 ;;
+  red) [ "$(printf '%s' "$counts" | jq .ours)" -gt 0 ] && exit 1 || exit 2 ;;
+esac
+exit 4

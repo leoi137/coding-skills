@@ -1,0 +1,242 @@
+#!/bin/bash
+# main-health [--refresh] [--json]
+#
+# Is main green right now? Reads the newest COMPLETED, NON-CANCELLED run of the CI workflow (ci.yml)
+# on main (push event). ci.yml has `cancel-in-progress: true`, which cancels main runs too, so
+# cancelled (and skipped/neutral) runs are passed over. When that run failed, each failed job's log
+# is fetched (gh api …/actions/jobs/<id>/logs) and reduced to signatures with ci-sigs.
+#
+# Cache: $LANES_HOME/main-health.json, reused for 10 minutes unless --refresh:
+#   {v:1, state: green|red|unknown, runId, sha, createdAt, attempt, url,
+#    failing:[{job, sig}], checkedAt}
+# Logs of a red run are fetched once per (runId, attempt); later refreshes reuse the failing list.
+# On a gh/network error nothing is written (the next call retries); the output is state "unknown"
+# carrying the last good record's failing list, with staleFrom = its checkedAt.
+#
+# Flaky list: $LANES_HOME/flaky.json {v:1, sigs:{"<sig>":{seen, lastSeen, reason, lastRun}}, scannedRuns:{}}
+# Heuristic (cheap by design — only the ~20 newest main runs are looked at, each re-run scanned once):
+#   1. env      every signature of kind `env` (Puppeteer WS timeout, registry ECONNRESET, runner lost, …)
+#               seen in a red main run is flaky by definition.
+#   2. rerun    a main run whose latest attempt (run_attempt > 1) succeeded on the same sha: every
+#               test/lint/type signature from its earlier failed attempts is flaky — the code did not
+#               change, the result did. `task|…` and `step|…` signatures are never recorded (too coarse:
+#               they would mark every future failure of that turbo task as flaky).
+#   `seen` counts distinct runs a signature was observed in; `scannedRuns` remembers runs already read.
+#
+# Output: one line, e.g. "main: red (run 123 @ abc1234, 3 failing: …)"; --json prints the record.
+# Exit: 0 green, 1 red, 2 unknown.
+set -uo pipefail
+. "$(cd "$(dirname "$0")" && pwd -P)/lib/common.sh"
+lanes_need jq gh
+
+TTL=600
+REFRESH=0 JSON=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --refresh) REFRESH=1 ;;
+    --json) JSON=1 ;;
+    -h|--help) sed -n '2,3p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) lanes_warn "unknown option $1"; exit 2 ;;
+  esac
+  shift
+done
+
+CACHE="$LANES_HOME/main-health.json"
+FLAKY="$LANES_HOME/flaky.json"
+SIGS="$LANES_BIN/ci-sigs"
+mkdir -p "$LANES_HOME" 2>/dev/null
+
+# _to <secs> cmd… — run cmd with a hard timeout (macOS has no timeout(1); gh ignores SIGALRM, so a
+# perl parent forks, waits, and kills the child's process group on expiry). Exit 124 on timeout.
+_to() {
+  perl -e '
+    use POSIX ();
+    my $t = shift; my $pid = fork; exit 127 unless defined $pid;
+    if ($pid == 0) { setpgrp(0, 0); exec @ARGV or exit 127 }
+    my $kill = sub { kill "TERM", -$pid;
+      for (1 .. 20) { last if waitpid($pid, POSIX::WNOHANG()) > 0; select(undef, undef, undef, 0.1) }
+      kill "KILL", -$pid; waitpid($pid, 0); };
+    $SIG{ALRM} = sub { $kill->(); exit 124 };
+    $SIG{INT} = $SIG{TERM} = $SIG{HUP} = sub { $kill->(); exit 130 };
+    alarm $t; waitpid($pid, 0); alarm 0;
+    exit($? & 127 ? 128 + ($? & 127) : $? >> 8);
+  ' "$@"
+}
+
+iso_epoch() {
+  date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null || date -u -d "$1" +%s 2>/dev/null || echo 0
+}
+
+summary_line() { # stdin: record JSON
+  jq -r '
+    def short: .[0:7];
+    def sigs: [.failing[] | .sig // empty] | unique;
+    def pick: (sigs | map(select(startswith("task|") | not))) as $d | (if ($d | length) > 0 then $d else sigs end);
+    if .state == "green" then "main: green (run \(.runId) @ \(.sha | short), \(.createdAt))"
+    elif .state == "red" then
+      (pick) as $p
+      | "main: red (run \(.runId) @ \(.sha | short), \($p | length) failing: "
+        + ([$p[0:3][] | .[0:110]] | join("; "))
+        + (if ($p | length) > 3 then "; +\(($p | length) - 3) more" else "" end) + ")"
+    else "main: unknown (\(.error // "no data")\(if .staleFrom then "; last good check \(.staleFrom)" else "" end))"
+    end'
+}
+
+finish() { # $1 = record JSON
+  if [ "$JSON" = 1 ]; then printf '%s\n' "$1" | jq .; else printf '%s\n' "$1" | summary_line; fi
+  case "$(printf '%s' "$1" | jq -r .state)" in green) exit 0 ;; red) exit 1 ;; *) exit 2 ;; esac
+}
+
+fail_unknown() { # $1 = reason
+  lanes_warn "$1"
+  local prev='{}'
+  [ -s "$CACHE" ] && prev=$(jq -c . "$CACHE" 2>/dev/null || echo '{}')
+  finish "$(jq -cn --argjson p "$prev" --arg e "$1" --arg now "$(lanes_now)" '
+    {v:1, state:"unknown", error:$e, runId:($p.runId // null), sha:($p.sha // null),
+     createdAt:($p.createdAt // null), failing:($p.failing // []), staleFrom:($p.checkedAt // null),
+     checkedAt:$now}')"
+}
+
+# ---- cache hit
+if [ "$REFRESH" = 0 ] && [ -s "$CACHE" ]; then
+  rec=$(jq -c 'select(.v == 1 and (.state == "green" or .state == "red"))' "$CACHE" 2>/dev/null)
+  if [ -n "$rec" ]; then
+    age=$(( $(lanes_epoch) - $(iso_epoch "$(printf '%s' "$rec" | jq -r .checkedAt)") ))
+    [ "$age" -ge 0 ] && [ "$age" -lt "$TTL" ] && finish "$rec"
+  fi
+fi
+
+# ---- newest settled main run
+runs=$(_to 30 gh run list -R "$LANES_REPO_SLUG" --workflow ci.yml --branch main --event push --limit 20 \
+  --json databaseId,status,conclusion,headSha,createdAt,attempt,url 2>/dev/null) \
+  || fail_unknown "gh run list failed or timed out"
+printf '%s' "$runs" | jq -e 'type == "array"' >/dev/null 2>&1 || fail_unknown "gh run list returned no JSON"
+
+run=$(printf '%s' "$runs" | jq -c '
+  [.[] | select(.status == "completed" and (.conclusion | IN("cancelled", "skipped", "neutral", "stale") | not))][0] // empty')
+[ -n "$run" ] || fail_unknown "no completed, non-cancelled main run among the last 20"
+
+run_id=$(printf '%s' "$run" | jq -r .databaseId)
+attempt=$(printf '%s' "$run" | jq -r '.attempt // 1')
+conclusion=$(printf '%s' "$run" | jq -r .conclusion)
+
+# Fetch the failed jobs of run $1 (attempt $2, or latest when empty) as "id<TAB>name" lines.
+failed_jobs() {
+  local path="repos/$LANES_REPO_SLUG/actions/runs/$1"
+  [ -n "${2:-}" ] && path="$path/attempts/$2"
+  _to 30 gh api "$path/jobs?per_page=100" \
+    --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out") | "\(.id)\t\(.name)"' 2>/dev/null
+}
+
+# Signatures of job $1, one per line ("" + non-zero exit when the log is unavailable).
+job_sigs() {
+  local tmp rc
+  tmp=$(mktemp "${TMPDIR:-/tmp}/main-health.XXXXXX") || return 1
+  _to 90 gh api --allow-escape-sequences "repos/$LANES_REPO_SLUG/actions/jobs/$1/logs" > "$tmp" 2>/dev/null </dev/null
+  rc=$?
+  if [ $rc -ne 0 ] || [ ! -s "$tmp" ]; then rm -f "$tmp"; return 1; fi
+  "$SIGS" "$tmp" </dev/null
+  rm -f "$tmp"
+}
+
+failing='[]'
+case "$conclusion" in
+  success) state=green ;;
+  *)
+    state=red
+    reuse=""
+    if [ -s "$CACHE" ]; then
+      reuse=$(jq -c --argjson id "$run_id" --argjson a "$attempt" \
+        'select(.state == "red" and .runId == $id and (.attempt // 1) == $a) | .failing' "$CACHE" 2>/dev/null)
+    fi
+    if [ -n "$reuse" ]; then
+      failing="$reuse"
+    else
+      jobs=$(failed_jobs "$run_id") || fail_unknown "could not list jobs of run $run_id"
+      while IFS="$(printf '\t')" read -r jid jname; do
+        [ -n "$jid" ] || continue
+        if sigs=$(job_sigs "$jid"); then
+          [ -n "$sigs" ] || sigs="step|$jname|"
+          failing=$(printf '%s\n' "$sigs" | jq -R . | jq -sc --argjson f "$failing" --arg j "$jname" \
+            '$f + [.[] | select(length > 0) | {job:$j, sig:.}]')
+        else
+          lanes_warn "log of job $jid ($jname) unavailable"
+          failing=$(jq -cn --argjson f "$failing" --arg j "$jname" '$f + [{job:$j, sig:null, error:"log unavailable"}]')
+        fi
+      done <<EOF
+$jobs
+EOF
+    fi
+    ;;
+esac
+
+now=$(lanes_now)
+record=$(jq -cn --argjson r "$run" --arg s "$state" --argjson f "$failing" --arg now "$now" '
+  {v:1, state:$s, runId:$r.databaseId, sha:$r.headSha, createdAt:$r.createdAt, attempt:($r.attempt // 1),
+   url:$r.url, failing:$f, checkedAt:$now}')
+printf '%s\n' "$record" | lanes_write "$CACHE" || lanes_warn "could not write $CACHE"
+
+# ---- flaky.json maintenance (best effort; a held lock just skips it this round)
+update_flaky() {
+  local lock="$LANES_HOME/locks/flaky-json" fl rr id att k jid jname sigs add tries=0
+  mkdir -p "$LANES_HOME/locks" 2>/dev/null
+  while ! mkdir "$lock" 2>/dev/null; do
+    # steal a lock older than 5 minutes (owner crashed)
+    if [ -n "$(find "$lock" -maxdepth 0 -mmin +5 2>/dev/null)" ]; then rmdir "$lock" 2>/dev/null; continue; fi
+    tries=$((tries + 1)); [ $tries -ge 10 ] && { lanes_warn "flaky.json busy; skipped"; return 0; }
+    sleep 1
+  done
+  trap 'rmdir "$lock" 2>/dev/null' EXIT
+
+  fl='{"v":1,"sigs":{},"scannedRuns":{}}'
+  [ -s "$FLAKY" ] && fl=$(jq -c '. + {v:1} | .sigs //= {} | .scannedRuns //= {}' "$FLAKY" 2>/dev/null || echo "$fl")
+
+  # add <runId> <reason> <sig…on stdin>
+  add() {
+    jq -R . | jq -sc --argjson fl "$fl" --arg run "$1" --arg why "$2" --arg now "$now" '
+      reduce (.[] | select(length > 0)) as $s ($fl;
+        .sigs[$s] = ((.sigs[$s] // {seen:0, reason:$why}) as $o
+          | $o + {seen: (if ($o.lastRun // "") == $run then $o.seen else $o.seen + 1 end),
+                  lastSeen:$now, lastRun:$run, reason:($o.reason // $why)}))'
+  }
+
+  # 1. env signatures of the current red run
+  if [ "$state" = red ]; then
+    k=$(printf '%s' "$failing" | jq -r '.[].sig // empty | select(startswith("env|"))' | sort -u)
+    [ -n "$k" ] && fl=$(printf '%s\n' "$k" | add "$run_id" "env")
+  fi
+
+  # 2. re-runs that passed on the same sha
+  rr=$(printf '%s' "$runs" | jq -r --argjson seen "$(printf '%s' "$fl" | jq -c '.scannedRuns')" '
+    .[] | select(.status == "completed" and .conclusion == "success" and (.attempt // 1) > 1
+                 and ($seen[(.databaseId | tostring)] | not)) | "\(.databaseId)\t\(.attempt)"')
+  while IFS="$(printf '\t')" read -r id att; do
+    [ -n "$id" ] || continue
+    k=1 ok=1
+    while [ "$k" -lt "$att" ]; do
+      if jobs=$(failed_jobs "$id" "$k"); then
+        while IFS="$(printf '\t')" read -r jid jname; do
+          [ -n "$jid" ] || continue
+          if sigs=$(job_sigs "$jid"); then
+            sigs=$(printf '%s\n' "$sigs" | grep -v -e '^task|' -e '^step|')
+            [ -n "$sigs" ] && fl=$(printf '%s\n' "$sigs" | add "$id" "rerun-pass: run $id attempt $k failed, attempt $att passed")
+          else ok=0
+          fi
+        done <<EOF2
+$jobs
+EOF2
+      else ok=0
+      fi
+      k=$((k + 1))
+    done
+    [ "$ok" = 1 ] && fl=$(printf '%s' "$fl" | jq -c --arg id "$id" --arg now "$now" '.scannedRuns[$id] = $now')
+  done <<EOF3
+$rr
+EOF3
+
+  printf '%s' "$fl" | jq . | lanes_write "$FLAKY" || lanes_warn "could not write $FLAKY"
+  rmdir "$lock" 2>/dev/null; trap - EXIT
+}
+update_flaky
+
+finish "$record"

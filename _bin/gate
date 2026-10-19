@@ -1,0 +1,373 @@
+#!/usr/bin/env bash
+# gate — the local CI gate for an amiara-stack lane. Run it from inside the lane's worktree.
+#
+#   gate unit   [opts]   after every unit of work (≤ ~90 s warm): prettier + per-package eslint on
+#                        changed files, related tests, whole-repo guards, cross-package scan tests,
+#                        added-line test-hygiene scan. Takes the `test` slot.
+#   gate push   [opts]   before every push (run_in_background): merge the base, then the unit steps
+#                        over the whole branch, turbo lint+typecheck for the changed packages (full
+#                        test suites + dependents are CI's; GATE_FULL_TESTS=on adds suites),
+#                        api typecheck when an api upstream changed, integration specs when Docker
+#                        and memory allow (else deferred to CI), release-target tests, attribution +
+#                        author-email sweep. Needs a clean tree. Takes `tsc,test` (+ `docker`).
+#   gate impact [opts] [--files a,b,…]   what CI will run for this diff (or for planned files);
+#                        no slot, no tests. /scope puts this in the plan.
+#
+# opts: -C <dir>  run in another worktree · --base <ref> (default origin/main; a sha for replays)
+#       --no-fetch · --no-merge (push: don't merge the base) · --fail-fast
+#
+# Writes <worktree>/.lane/gate.json (or impact.json) and per-step logs in .lane/gate-logs/.
+# Exit 0 all green · 1 something failed · 2 could not run.
+#
+# Why each step exists (2026-10-19 CI log analysis): root eslint.config.js ignores apps/web etc., so
+# eslint runs per package; turbo --affected locally diffs against a stale local main, so
+# TURBO_SCM_BASE is exported; cross-package scan tests read other packages' files and are invisible
+# to --affected; api's tsconfig.typecheck covers *.integration.spec.ts (TS2739 after type changes).
+set -uo pipefail
+
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/lib/common.sh" || exit 2
+lanes_need git jq pnpm
+
+MODE="${1:-}"; shift || true
+case "$MODE" in unit|push|impact) ;; ""|-h|--help) sed -n '2,24p' "$0"; exit 0 ;; *) lanes_die "unknown mode '$MODE' (unit|push|impact)" ;; esac
+
+DIR="$PWD"; BASE_REF="origin/main"; FETCH=1; MERGE=1; FAIL_FAST=0; PLANNED=""; IN_SLOT=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -C) DIR="$2"; shift 2 ;;
+    --base) BASE_REF="$2"; shift 2 ;;
+    --no-fetch) FETCH=0; shift ;;
+    --no-merge) MERGE=0; shift ;;
+    --fail-fast) FAIL_FAST=1; shift ;;
+    --files) PLANNED="$2"; shift 2 ;;
+    --in-slot) IN_SLOT=1; shift ;;
+    *) lanes_die "unknown option '$1'" ;;
+  esac
+done
+
+TOP=$(lanes_toplevel "$DIR") || lanes_die "$DIR is not inside a git checkout"
+cd "$TOP" || exit 2
+LANE_DIR="$TOP/.lane"; LOGS="$LANE_DIR/gate-logs"
+mkdir -p "$LOGS"
+common=$(git rev-parse --path-format=absolute --git-common-dir)
+grep -qx '.lane/' "$common/info/exclude" 2>/dev/null || { mkdir -p "$common/info"; printf '.lane/\n' >> "$common/info/exclude"; }
+
+# Take the machine-wide slots once for the whole run (re-exec under heavy). Nothing inside may call
+# heavy for a slot it already holds; docker is requested separately (later in lock order).
+if [ $IN_SLOT = 0 ] && [ "${LANES_OFF:-}" != 1 ]; then
+  case "$MODE" in
+    unit) exec "$LANES_BIN/heavy" test -- "$0" "$MODE" -C "$TOP" --base "$BASE_REF" $([ $FETCH = 0 ] && echo --no-fetch) $([ $FAIL_FAST = 1 ] && echo --fail-fast) --in-slot ;;
+    push) exec "$LANES_BIN/heavy" tsc,test -- "$0" "$MODE" -C "$TOP" --base "$BASE_REF" $([ $FETCH = 0 ] && echo --no-fetch) $([ $MERGE = 0 ] && echo --no-merge) $([ $FAIL_FAST = 1 ] && echo --fail-fast) --in-slot ;;
+  esac
+fi
+
+STARTED=$(lanes_epoch); STEPS="$LOGS/.steps.$MODE.jsonl"; : > "$STEPS"; FAILED=0
+
+# --- step bookkeeping ------------------------------------------------------------------------
+
+record() { # name status rc seconds log detail
+  jq -nc --arg n "$1" --arg s "$2" --arg rc "$3" --arg d "$4" --arg l "$5" --arg x "${6:-}" \
+    '{name: $n, status: $s, rc: ($rc|tonumber), seconds: ($d|tonumber), log: $l, detail: $x}' >> "$STEPS"
+}
+say() { printf '%-8s %-34s %s\n' "$1" "$2" "${3:-}"; }
+
+# run_step <name> <cmd…>: output to a log; continue on failure unless --fail-fast.
+run_step() {
+  local name="$1" log t0 rc dt note; shift
+  log="$LOGS/$MODE-$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '_').log"
+  t0=$(lanes_epoch); note=""
+  { printf '$ %s\n' "$*"; "$@"; } > "$log" 2>&1
+  rc=$?
+  # a crashed worker is the machine, not the code (seen: jest worker SIGSEGV under memory pressure) — retry once
+  if [ $rc != 0 ] && grep -Eq 'terminated by another process: signal=SIG(SEGV|KILL|BUS)|JavaScript heap out of memory|ERR_WORKER_OUT_OF_MEMORY' "$log"; then
+    mv "$log" "$log.crash"; note="retried after a worker crash ($log.crash)"
+    { printf '$ %s\n' "$*"; "$@"; } > "$log" 2>&1
+    rc=$?
+  fi
+  dt=$(( $(lanes_epoch) - t0 ))
+  if [ $rc = 0 ]; then say pass "$name" "${dt}s${note:+  ($note)}"; record "$name" pass 0 "$dt" "$log" "$note"
+  else
+    say FAIL "$name" "${dt}s  → $log"; record "$name" fail "$rc" "$dt" "$log" "$note"; FAILED=1
+    tail -n 25 "$log" | sed 's/^/         │ /'
+    [ $FAIL_FAST = 1 ] && finish
+  fi
+  return 0
+}
+skip_step() { say skip "$1" "$2"; record "$1" skip 0 0 "" "$2"; }
+defer_step() { say defer "$1" "$2"; record "$1" deferred 0 0 "" "$2"; }
+
+finish() {
+  local dur sigs out
+  dur=$(( $(lanes_epoch) - STARTED ))
+  sigs="[]"
+  if [ -x "$LANES_BIN/ci-sigs" ]; then
+    sigs=$(jq -r 'select(.status == "fail") | "\(.log)\t\(.name)"' "$STEPS" | while IFS="$(printf '\t')" read -r l n; do
+      [ -n "$l" ] || continue
+      pk=$(printf '%s' "$n" | grep -oE '(apps|packages|tools)/[A-Za-z0-9._-]+' | head -1)
+      "$LANES_BIN/ci-sigs" ${pk:+--pkg "$pk"} --root "$TOP" "$l" 2>/dev/null
+    done | sort -u | jq -R . | jq -s 'map(select(. != ""))')
+  fi
+  out="$LANE_DIR/gate.json"; [ "$MODE" = impact ] && out="$LANE_DIR/gate-impact-run.json"
+  jq -s --arg mode "$MODE" --arg base "$BASE_REF" --arg mb "${MB:-}" --arg head "$(git rev-parse HEAD)" \
+    --arg branch "$(git symbolic-ref -q --short HEAD || echo detached)" --arg t "$(lanes_now)" --arg d "$dur" \
+    --argjson pkgs "$(printf '%s\n' ${PKGS:-} | jq -R . | jq -s 'map(select(. != ""))')" --argjson sigs "$sigs" \
+    '{v: 1, mode: $mode, base: $base, mergeBase: $mb, head: $head, branch: $branch, finishedAt: $t,
+      seconds: ($d|tonumber), packages: $pkgs, result: (if any(.[]; .status == "fail") then "fail" else "pass" end),
+      steps: ., failedSteps: [.[] | select(.status == "fail") | .name], sigs: $sigs}' "$STEPS" | lanes_write "$out"
+  echo
+  if [ $FAILED = 1 ]; then echo "gate $MODE: FAIL in ${dur}s — $(jq -r '.failedSteps | join(", ")' "$out")  ($out)"; exit 1; fi
+  echo "gate $MODE: pass in ${dur}s ($out)"; exit 0
+}
+
+# --- what changed ----------------------------------------------------------------------------
+
+if [ $FETCH = 1 ]; then git fetch -q origin main 2>/dev/null || lanes_warn "git fetch origin main failed; using the local origin/main"; fi
+git rev-parse -q --verify "$BASE_REF^{commit}" >/dev/null || lanes_die "base '$BASE_REF' not found"
+
+if [ "$MODE" = push ]; then
+  [ -z "$(git status --porcelain --untracked-files=no)" ] || { echo "gate push: commit or stash tracked changes first (the push gate checks what will be pushed)" >&2; exit 2; }
+  if [ $MERGE = 1 ] && ! git merge-base --is-ancestor "$BASE_REF" HEAD; then
+    t0=$(lanes_epoch); log="$LOGS/push-merge-base.log"
+    if git merge --no-edit "$BASE_REF" > "$log" 2>&1; then
+      say pass "merge $BASE_REF" "$(( $(lanes_epoch) - t0 ))s"; record "merge base" pass 0 "$(( $(lanes_epoch) - t0 ))" "$log"
+    else
+      git merge --abort 2>/dev/null
+      say FAIL "merge $BASE_REF" "conflicts — resolve by hand, then rerun"; record "merge base" fail 1 0 "$log"; FAILED=1; finish
+    fi
+  fi
+fi
+
+MB=$(git merge-base "$BASE_REF" HEAD) || lanes_die "no merge base with $BASE_REF"
+export TURBO_SCM_BASE="$MB" TURBO_SCM_HEAD=HEAD
+if [ "${GATE_SHARED_CACHE:-1}" = 1 ]; then export TURBO_CACHE_DIR="${TURBO_CACHE_DIR:-$HOME/.cache/turbo/amiara-stack}"; fi
+
+if [ -n "$PLANNED" ]; then
+  FILES=$(printf '%s' "$PLANNED" | tr ',' '\n' | sed '/^$/d')
+else
+  FILES=$( { git diff --name-only --diff-filter=ACMR "$MB"; [ "$MODE" = push ] || git ls-files -m -o --exclude-standard; } \
+    | grep -v '^\.lane/' | sort -u | while IFS= read -r f; do [ -f "$f" ] && printf '%s\n' "$f"; done)
+fi
+PKGS=$(printf '%s\n' "$FILES" | lanes_pkg_dirs "$TOP")
+ADDED_TESTS=$( { git diff --name-only --diff-filter=AR "$MB"; [ "$MODE" = push ] || git ls-files -o --exclude-standard; } | grep -E '\.(test|spec)\.[cm]?[jt]sx?$')
+has() { printf '%s\n' "$FILES" | grep -Eq "$1"; }
+
+echo "gate $MODE · $(git symbolic-ref -q --short HEAD || echo detached) @ $(git rev-parse --short HEAD) · base $BASE_REF @ $(git rev-parse --short "$MB") · $(printf '%s\n' "$FILES" | grep -c .) files · packages: $(echo $PKGS)"
+echo
+
+# api and the packages it imports (workspace deps)
+API_UPSTREAM=$(jq -r '[(.dependencies // {}), (.devDependencies // {})] | add | to_entries[] | select(.value | startswith("workspace:")) | .key' apps/api/package.json 2>/dev/null)
+pkg_dir_of_name() { local d; for d in apps/* packages/* tools/*; do [ "$(lanes_pkg_name "$TOP" "$d")" = "$1" ] && { echo "$d"; return; }; done; }
+
+# --- impact ----------------------------------------------------------------------------------
+
+if [ "$MODE" = impact ]; then
+  [ -n "$PKGS" ] || echo "no workspace packages touched"
+  if [ -n "$PLANNED" ]; then
+    own_f=""; deps_f=""
+    for d in $PKGS; do own_f="$own_f --filter={./$d}"; deps_f="$deps_f --filter=...{./$d}"; done
+  else
+    own_f="--filter=[$MB...HEAD]"; deps_f="--filter=...[$MB...HEAD]"
+  fi
+  dry() { # filter args → task ids that have a command
+    [ -n "$PKGS" ] || return 0
+    pnpm exec turbo run lint typecheck test build $1 --dry=json 2>/dev/null | jq -r '.tasks[] | select(.command != "<NONEXISTENT>") | .taskId' | sort
+  }
+  own=$(dry "$own_f"); deps=$(dry "$deps_f")
+  integ=no; has '\.integration\.spec\.ts$|^packages/db-schema/drizzle/' && integ=yes
+  api_tc=no; for n in $API_UPSTREAM; do d=$(pkg_dir_of_name "$n"); [ -n "$d" ] && printf '%s\n' "$PKGS" | grep -qx "$d" && api_tc=yes; done
+  printf '%s\n' "$PKGS" | grep -qx apps/api && api_tc="own"
+  jq -n --arg mb "$MB" --argjson files "$(printf '%s\n' "$FILES" | jq -R . | jq -s 'map(select(. != ""))')" \
+    --argjson pkgs "$(printf '%s\n' $PKGS | jq -R . | jq -s 'map(select(. != ""))')" \
+    --argjson own "$(printf '%s\n' "$own" | jq -R . | jq -s 'map(select(. != ""))')" \
+    --argjson deps "$(printf '%s\n' "$deps" | jq -R . | jq -s 'map(select(. != ""))')" \
+    --arg integ "$integ" --arg apitc "$api_tc" \
+    --arg theme "$(has '^(apps/web|packages/(ui|components|auth))/' && echo yes || echo no)" \
+    --arg disc "$([ -n "$ADDED_TESTS" ] && echo yes || echo no)" \
+    --arg rel "$(has '^(scripts|deploy|\.github)/' && echo yes || echo no)" \
+    '{mergeBase: $mb, files: $files, packages: $pkgs, localTasks: $own, ciTasksWithDependents: $deps,
+      integration: $integ, apiTypecheck: $apitc, themeCheck: $theme, testDiscovery: $disc, releaseTargets: $rel,
+      alwaysCi: ["format (whole repo)", "cross-app-reach", "theme:check", "build (affected apps)", "mastra parity", "aimock smoke"]}' \
+    | tee "$LANE_DIR/impact.json" | jq -r '
+      "packages:       \(.packages | join(", "))",
+      "local gate:     \(.localTasks | length) turbo tasks",
+      "CI (affected):  \(.ciTasksWithDependents | length) turbo tasks incl. dependents: \([.ciTasksWithDependents[] | split("#")[0]] | unique | join(", "))",
+      "api typecheck:  \(.apiTypecheck)    integration specs: \(.integration)",
+      "theme:check:    \(.themeCheck)    test:discovery: \(.testDiscovery)    release-targets: \(.releaseTargets)"'
+  exit 0
+fi
+
+# --- unit-level steps (unit: changed files; push: whole branch) -------------------------------
+
+lintable() { grep -E '\.([cm]?[jt]sx?)$'; }
+
+step_prettier() {
+  local f; f=$(printf '%s\n' "$FILES" | sed '/^$/d')
+  [ -n "$f" ] || { skip_step prettier "no files"; return; }
+  run_step prettier sh -c 'printf "%s\n" "$@" | xargs pnpm exec prettier --check --ignore-unknown' _ $f
+}
+
+step_eslint() {
+  local d rel
+  for d in $PKGS; do
+    rel=$(printf '%s\n' "$FILES" | grep "^$d/" | lintable | sed "s#^$d/##")
+    [ -n "$rel" ] || continue
+    # cache inside .lane/ — a default .eslintcache lands untracked in the package and can get committed
+    run_step "eslint $d" sh -c 'cd "$1" && c="$2" && shift 2 && pnpm exec eslint --cache --cache-location "$c" --no-warn-ignored "$@"' _ "$d" "$LANE_DIR/eslintcache/$(printf '%s' "$d" | tr '/' '_')/" $rel
+  done
+}
+
+# leading VAR=val assignments of the vitest segment of a package's test script
+vitest_env() {
+  jq -r '.scripts.test // ""' "$1/package.json" | tr '&' '\n' | grep vitest | head -1 \
+    | grep -oE "([A-Z_][A-Z0-9_]*=[^ ]+[[:space:]]+)+vitest" | sed -E 's/[[:space:]]*vitest$//'
+}
+
+step_related_tests() {
+  local d src tests runner env
+  for d in $PKGS; do
+    src=$(printf '%s\n' "$FILES" | grep "^$d/" | lintable | grep -vE '\.(test|spec)\.[cm]?[jt]sx?$' | sed "s#^$d/##")
+    tests=$(printf '%s\n' "$FILES" | grep "^$d/" | grep -E '\.(test|spec)\.[cm]?[jt]sx?$' | sed "s#^$d/##")
+    [ -n "$src$tests" ] || continue
+    runner=$(lanes_pkg_runner "$TOP" "$d")
+    case "$runner" in
+      vitest)
+        env=$(vitest_env "$d")
+        slug=$(printf '%s' "$d" | tr '/' '_')
+        [ -z "$src" ] || run_step "tests $d (related)" sh -c 'cd "$1"; e="$2"; j="$3"; shift 3; env VITEST_MAX_WORKERS=2 $e pnpm exec vitest related --run --passWithNoTests --reporter=default --reporter=json --outputFile.json="$j" "$@"' _ "$d" "$env" "$LOGS/durations-$slug-related.json" $src
+        [ -z "$tests" ] || run_step "tests $d (changed specs)" sh -c 'cd "$1"; e="$2"; j="$3"; shift 3; env VITEST_MAX_WORKERS=2 $e pnpm exec vitest run --passWithNoTests --reporter=default --reporter=json --outputFile.json="$j" "$@"' _ "$d" "$env" "$LOGS/durations-$slug-specs.json" $tests ;;
+      jest)
+        run_step "tests $d (related)" sh -c 'cd "$1"; shift; pnpm run test --findRelatedTests "$@" --passWithNoTests --maxWorkers=2' _ "$d" $src $tests ;;
+      node)
+        run_step "tests $d" sh -c 'cd "$1" && pnpm run test' _ "$d" ;;
+      *) skip_step "tests $d" "no test runner" ;;
+    esac
+  done
+}
+
+# Tests that use a tenth of their timeout here go red under CI load: #303's token-budget test took
+# 534 ms on this Mac and blew vitest's 5 s default in CI (≥10× slower). The limit is the package's
+# testTimeout (vitest config; 5000 default) / GATE_SLOW_RATIO (10). A file that sets its own timeout
+# is skipped. Remedy: an explicit per-test timeout, or a faster test.
+step_slow_tests() {
+  local out="$LOGS/$MODE-slow-tests.log" f slug d timeout limit n
+  : > "$out"
+  for f in "$LOGS"/durations-*.json; do
+    [ -f "$f" ] || continue
+    slug=$(basename "$f" .json); slug="${slug#durations-}"; slug="${slug%-related}"; slug="${slug%-specs}"
+    d=$(printf '%s' "$slug" | tr '_' '/')
+    timeout=$(cat "$d"/vitest.config.* 2>/dev/null | grep -oE 'testTimeout:[[:space:]]*[0-9_]+' | head -1 | grep -oE '[0-9_]+$' | tr -d _)
+    timeout="${timeout:-5000}"; limit=$(( timeout / ${GATE_SLOW_RATIO:-10} ))
+    jq -r --argjson ms "$limit" --arg t "$timeout" '.testResults[]? | .name as $file | .assertionResults[]?
+      | select((.duration // 0) > $ms) | "\($file)\t\(.duration|floor)\t\($t)\t\(.fullName // .title)"' "$f" 2>/dev/null
+  done | sort -t "$(printf '\t')" -k1,1 -k4,4 -u | while IFS="$(printf '\t')" read -r file ms t name; do
+    grep -Eq 'testTimeout|timeout:|[},][[:space:]]*[0-9_]{4,}[[:space:]]*\)' "$file" 2>/dev/null && continue
+    printf '%s: %sms here vs a %sms timeout (CI runs up to 10× slower): %s\n' "${file#"$TOP"/}" "$ms" "$t" "$name"
+  done > "$out"
+  n=$(grep -c . "$out")
+  if [ "$n" = 0 ]; then say pass "slow-test check"; record "slow-test check" pass 0 0 "$out"
+  else say FAIL "slow-test check" "$n test(s) at risk of a CI timeout — give each an explicit timeout or make it faster → $out"; sed 's/^/         │ /' "$out" | head -10
+    record "slow-test check" fail 1 0 "$out"; FAILED=1; fi
+}
+
+step_guards() {
+  if [ -f scripts/check-cross-app-reach.mjs ]; then run_step cross-app-reach node scripts/check-cross-app-reach.mjs; fi
+  if has '^(apps/web|packages/(ui|components|auth))/'; then run_step theme:check pnpm --filter ./apps/web run theme:check
+  else skip_step theme:check "no web/ui change"; fi
+  # test:discovery lists every package's tests (vitest list / jest --listTests ×~30): 416 s in the
+  # 2026-10-19 #291 replay. CI runs it first in the test job; force it locally with GATE_DISCOVERY=on.
+  if [ -z "$ADDED_TESTS" ]; then skip_step test:discovery "no test file added/renamed"
+  elif [ "${GATE_DISCOVERY:-off}" = on ]; then run_step test:discovery pnpm test:discovery
+  else defer_step test:discovery "test file added — CI's test job checks discovery (~7 min locally; GATE_DISCOVERY=on)"; fi
+}
+
+# Tests that read other packages' files: --affected never selects them, so a change elsewhere turns
+# main red on the next push that touches their package.
+step_scan_tests() {
+  if [ -f packages/core/src/tests/constants/actionBirth.test.ts ]; then
+    run_step "scan: core actionBirth" sh -c 'cd packages/core && LOG_LEVEL=silent pnpm exec vitest run src/tests/constants/actionBirth.test.ts'
+  fi
+  if [ -f packages/db-schema/tests/catalog-retired-actions.test.ts ]; then
+    run_step "scan: db-schema retired actions" sh -c 'cd packages/db-schema && LOG_LEVEL=silent pnpm exec tsx --test tests/catalog-retired-actions.test.ts'
+  fi
+}
+
+# Added-line hygiene scan (skill-enforced test standards, final-architecture §3.10). Fails only on
+# high-precision hits (focused/skipped tests, suppressions without a reason); wall clock and real
+# sleeps are warnings for the reviewer — 258 existing specs use new Date(), so they can't block.
+step_added_line_scan() {
+  local out="$LOGS/$MODE-added-line-scan.log" f added errs warns
+  : > "$out"
+  for f in $(printf '%s\n' "$FILES" | grep -E '\.(test|spec)\.[cm]?[jt]sx?$'); do
+    added=$(git diff -U0 "$MB" -- "$f" 2>/dev/null | grep -E '^\+[^+]' | sed 's/^+//')
+    [ -n "$added" ] || added=$( [ -z "$(git ls-files "$f")" ] && cat "$f" )
+    [ -n "$added" ] || continue
+    printf '%s\n' "$added" | grep -nE '(^|[^A-Za-z0-9_])(it|test|describe)\.(only|skip|todo)\(' | sed "s#^#error $f: focused/skipped test: #" >> "$out"
+    if ! grep -Eq 'useFakeTimers|setSystemTime|mock\.timers' "$f"; then
+      printf '%s\n' "$added" | grep -nE 'new Date\(\)|Date\.now\(\)' | sed "s#^#warn  $f: wall clock without fake timers: #" >> "$out"
+    fi
+    printf '%s\n' "$added" | grep -nE 'setTimeout\([^)]*,[[:space:]]*([1-9][0-9]+|[A-Za-z_])' | sed "s#^#warn  $f: real-time wait: #" >> "$out"
+  done
+  for f in $(printf '%s\n' "$FILES" | grep -E '\.[cm]?[jt]sx?$'); do
+    added=$(git diff -U0 "$MB" -- "$f" 2>/dev/null | grep -E '^\+[^+]' | sed 's/^+//')
+    [ -n "$added" ] || continue
+    printf '%s\n' "$added" | grep -nE '(@ts-ignore|@ts-expect-error|eslint-disable[a-z-]*)' | grep -v -- '-- ' | sed "s#^#error $f: suppression without a '-- reason': #" >> "$out"
+  done
+  errs=$(grep -c '^error' "$out"); warns=$(grep -c '^warn' "$out")
+  if [ "$errs" != 0 ]; then say FAIL "added-line scan" "$errs error(s), $warns warning(s) → $out"; grep '^error' "$out" | head -10 | sed 's/^/         │ /'
+    record "added-line scan" fail 1 0 "$out" "$errs errors, $warns warnings"; FAILED=1
+  elif [ "$warns" != 0 ]; then say warn "added-line scan" "$warns warning(s) for review → $out"; record "added-line scan" warn 0 0 "$out" "$warns warnings"
+  else say pass "added-line scan"; record "added-line scan" pass 0 0 "$out"; fi
+}
+
+# --- run -------------------------------------------------------------------------------------
+
+if [ -z "$FILES" ]; then echo "nothing changed against $BASE_REF"; finish; fi
+
+step_prettier
+step_eslint
+rm -f "$LOGS"/durations-*.json
+step_related_tests
+step_slow_tests
+step_guards
+step_scan_tests
+step_added_line_scan
+
+if [ "$MODE" = push ]; then
+  if [ -n "$PKGS" ]; then
+    # Full package suites are CI's (an L branch's agent jest suite alone ran 5+ min locally); the
+    # related/changed-spec steps above cover the branch's own tests. GATE_FULL_TESTS=on adds them.
+    tasks="lint typecheck"; [ "${GATE_FULL_TESTS:-off}" = on ] && tasks="lint typecheck test"
+    run_step "turbo $(echo $tasks | tr ' ' '+')" env VITEST_MAX_WORKERS=2 pnpm exec turbo run $tasks \
+      --filter="[$MB...HEAD]" --concurrency=1 --continue --output-logs=errors-only
+  fi
+  api_tc=0
+  for n in $API_UPSTREAM; do d=$(pkg_dir_of_name "$n"); [ -n "$d" ] && printf '%s\n' "$PKGS" | grep -qx "$d" && api_tc=1; done
+  if [ $api_tc = 1 ] && ! printf '%s\n' "$PKGS" | grep -qx apps/api; then
+    run_step "typecheck apps/api (upstream changed)" pnpm --filter api run typecheck
+  fi
+  specs=$(printf '%s\n' "$FILES" | grep -E '^apps/api/.*\.integration\.spec\.ts$' | sed 's#^apps/api/##')
+  if [ -n "$specs" ] || has '^packages/db-schema/drizzle/'; then
+    if ! docker info >/dev/null 2>&1; then defer_step "integration specs" "Docker not running — CI runs them"
+    elif [ "${GATE_INTEGRATION:-auto}" = off ]; then defer_step "integration specs" "GATE_INTEGRATION=off"
+    elif [ -z "$specs" ]; then defer_step "integration specs" "migration changed; full suite is CI's (~20 min)"
+    else
+      run_step "integration specs" "$LANES_BIN/heavy" docker -- sh -c 'cd apps/api && pnpm exec vitest run -c vitest.integration.config.mts "$@"' _ $specs
+    fi
+  fi
+  # a separate CI job, not a turbo task: #297 went red on it (2026-10-19 replay evidence)
+  if has '^packages/(agent|mastra)/' && [ -n "$(jq -r '.scripts["test:mastra-agui-parity"] // empty' packages/agent/package.json 2>/dev/null)" ]; then
+    run_step "mastra-agui parity" pnpm --filter @amiara/agent test:mastra-agui-parity
+  fi
+  if has '^(scripts|deploy|\.github)/' && [ -f scripts/release-targets.test.mjs ]; then
+    run_step release-targets node --test scripts/release-targets.test.mjs
+  fi
+  # nothing attributed, no PII author email, in what this push sends
+  range="$MB..HEAD"; git rev-parse -q --verify '@{u}' >/dev/null && range='@{u}..HEAD'
+  sweep="$LOGS/push-sweep.log"
+  { git log --no-merges -i --grep='co-authored-by' --grep='generated with' --format='%h attribution: %s' $range
+    git log --no-merges --format='%h %ae' $range | grep -v 'users\.noreply\.github\.com$' | sed 's/^/author email not noreply: /'; } > "$sweep" 2>&1
+  if [ -s "$sweep" ]; then say FAIL "attribution/email sweep" "→ $sweep"; sed 's/^/         │ /' "$sweep"; record "attribution/email sweep" fail 1 0 "$sweep"; FAILED=1
+  else say pass "attribution/email sweep"; record "attribution/email sweep" pass 0 0 "$sweep"; fi
+fi
+
+finish

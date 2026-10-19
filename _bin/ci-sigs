@@ -1,0 +1,391 @@
+#!/bin/bash
+# ci-sigs [--pkg <name|dir>] [--root <dir>] [file...]
+#
+# Extract normalized failure signatures from a GitHub Actions job log or a local gate log
+# (turbo / vitest / jest / node:test / tsc / eslint / prettier / repo guards). Reads stdin
+# when no file is given. Prints one signature per line, sorted unique: kind|scope|detail
+#
+#   task|<pkg>#<task>|           turbo: "Failed:  api#typecheck", "ERROR  api#typecheck: command … exited"
+#   ts|<file>|TS<code>           tsc "file(l,c): error TSnnnn" and pretty "file:l:c - error TSnnnn"
+#   vitest|<file>|<a > b > test> " FAIL  file > suite > test"; "× test" under "❯ file (n tests | m failed)"
+#                                when no FAIL line names that file; "(file)" for a suite that failed to
+#                                load; "(unhandled error)" from "This error originated in …"
+#   jest|<file>|<suite > test>   "FAIL file" + "● Suite › test"; "(file)" when no ● line follows
+#   nodetest|<file|pkg>|<name>   TAP "not ok N - name" (+ YAML location); suites with
+#                                failureType 'subtestsFailed' are skipped (their failing child is kept)
+#   eslint|<file>|<rule>         stylish error rows (warnings ignored)
+#   prettier|<file>|             "[warn] file" from --check ("|error" for "[error] file: …")
+#   reach|<file>|<from>-><to>    check-cross-app-reach violations ("|stale-allowlist" for stale keys)
+#   theme|<metric>|              theme:check ratchet rows marked FAIL
+#   discovery|<problem line>|    test:discovery problems (first line of each)
+#   build|<file>|<type-error|module-not-found>   next build "Failed to compile" blocks
+#   smoke|aimock-agui|<message>  "AIMock AG-UI smoke failed: …" (digits normalized to N)
+#   env|<marker>|<test file>     known environmental markers; detail names the failing test file when the
+#                                marker sits inside that test's failure block, else empty
+#   step|<command>|              fallback only: the failing step's "Run" command when nothing else matched
+#
+# Paths are made repo-relative: turbo prefixes lines with "<pkg>:<task>: " locally and wraps tasks in
+# "##[group]<pkg>:<task>" on CI; tool paths inside a task are package-relative, so the package name is
+# mapped to its dir via $LANES_HOME/cache/pkg-map.tsv (name<TAB>dir<TAB>runner, built from the main
+# checkout's pnpm-workspace.yaml globs, rebuilt when older than a day). --pkg sets the package context
+# for logs with no turbo framing (e.g. `pnpm --filter api exec vitest …`).
+#
+# bash 3.2 + BSD awk/sed. Never fails on odd input: unparseable logs just yield fewer signatures.
+set -uo pipefail
+. "$(cd "$(dirname "$0")" && pwd -P)/lib/common.sh"
+
+usage() { sed -n '2,3p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+DEFPKG="" ROOT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --pkg) DEFPKG="${2:-}"; shift 2 ;;
+    --root) ROOT="${2:-}"; shift 2 ;;
+    -h|--help) usage 0 ;;
+    --) shift; break ;;
+    -*) lanes_warn "unknown option $1"; usage 2 ;;
+    *) break ;;
+  esac
+done
+[ -n "$ROOT" ] || ROOT=$(lanes_toplevel 2>/dev/null || true)
+
+MAP="$LANES_HOME/cache/pkg-map.tsv"
+
+# Build name<TAB>dir<TAB>runner for every workspace package of the repo at $1.
+build_pkg_map() {
+  local root="$1" globs g d name
+  [ -f "$root/pnpm-workspace.yaml" ] || return 1
+  globs=$(awk '
+    /^packages:/ { on = 1; next }
+    on && /^[^ \t#-]/ { on = 0 }
+    on && /^[ \t]*-[ \t]*/ { s = $0; sub(/^[ \t]*-[ \t]*/, "", s); gsub(/["\047]/, "", s); sub(/[ \t]+#.*$/, "", s); if (s !~ /^!/) print s }
+  ' "$root/pnpm-workspace.yaml")
+  for g in $globs; do
+    for d in $root/$g; do
+      [ -f "$d/package.json" ] || continue
+      name=$(jq -r '.name // empty' "$d/package.json" 2>/dev/null) || continue
+      [ -n "$name" ] || continue
+      d=${d#"$root"/}
+      printf '%s\t%s\t%s\n' "$name" "$d" "$(lanes_pkg_runner "$root" "$d")"
+    done
+  done
+}
+
+ensure_pkg_map() {
+  local src="" fresh=""
+  [ -s "$MAP" ] && fresh=$(find "$MAP" -mtime -1 2>/dev/null)
+  [ -n "$fresh" ] && return 0
+  if [ -f "$LANES_MAIN_CHECKOUT/pnpm-workspace.yaml" ]; then src="$LANES_MAIN_CHECKOUT"
+  elif [ -n "$ROOT" ] && [ -f "$ROOT/pnpm-workspace.yaml" ]; then src="$ROOT"
+  fi
+  if [ -z "$src" ]; then
+    [ -s "$MAP" ] || lanes_warn "no workspace to build $MAP from; paths stay package-relative"
+    return 0
+  fi
+  build_pkg_map "$src" | lanes_write "$MAP" || lanes_warn "could not write $MAP"
+}
+ensure_pkg_map
+[ -f "$MAP" ] || MAP=/dev/null
+for f in "$@"; do [ -r "$f" ] || lanes_warn "cannot read $f"; done
+
+ESC=$(printf "\033")
+BEL=$(printf "\007")
+BOM=$(printf '\357\273\277')
+
+# Strip BOM, CR, the GitHub timestamp prefix and ANSI/OSC escapes, then parse.
+cat "$@" 2>/dev/null \
+| LC_ALL=C sed -E \
+    -e "s/^$BOM//" \
+    -e 's/\r$//' \
+    -e 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z //' \
+    -e "s/$ESC\\[[0-9;?]*[A-Za-z]//g" \
+    -e "s/$ESC\\][^$BEL$ESC]*($BEL|$ESC\\\\)?//g" \
+| LC_ALL=C awk -v MAPFILE="$MAP" -v DEFPKG="$DEFPKG" -v ROOT="$ROOT" '
+function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+function u8cut(s, n) {
+  if (length(s) <= n) return s
+  s = substr(s, 1, n)
+  if (match(s, /[\300-\337]$/)) s = substr(s, 1, RSTART - 1)
+  else if (match(s, /[\340-\357][\200-\277]?$/)) s = substr(s, 1, RSTART - 1)
+  else if (match(s, /[\360-\367][\200-\277]?[\200-\277]?$/)) s = substr(s, 1, RSTART - 1)
+  return s
+}
+function clean(s, n) { gsub(/\|/, "/", s); gsub(/[ \t]+/, " ", s); return u8cut(trim(s), n ? n : 300) }
+function emit(kind, scope, detail,   k) {
+  if (scope == "") scope = "?"
+  k = kind "|" clean(scope, 240) "|" clean(detail)
+  if (k in SEEN) return
+  SEEN[k] = 1; OUT[++NOUT] = k
+  if (kind != "task" && kind != "step") NONTASK++
+}
+function norm(p,   n, i, parts, out, k, res) {
+  n = split(p, parts, "/"); k = 0
+  for (i = 1; i <= n; i++) {
+    if (parts[i] == "" || parts[i] == ".") continue
+    if (parts[i] == "..") { if (k > 0) k--; continue }
+    out[++k] = parts[i]
+  }
+  res = ""
+  for (i = 1; i <= k; i++) res = res (i > 1 ? "/" : "") out[i]
+  return res
+}
+function stripabs(p,   i) {
+  if (ROOT != "" && index(p, ROOT "/") == 1) return substr(p, length(ROOT) + 2)
+  if (match(p, /^\/home\/runner\/work\/[^\/]+\/[^\/]+\//)) return substr(p, RLENGTH + 1)
+  if (index(p, "/amiara-stack/") > 0) {
+    while ((i = index(p, "/amiara-stack/")) > 0) p = substr(p, i + 14)
+    sub(/^\.claude\/worktrees\/[^\/]+\//, "", p)
+    return p
+  }
+  if (match(p, /\/(apps|packages|tools)\//)) return substr(p, RSTART + 1)
+  return p
+}
+function pdir(p) { return (p in PKGDIR) ? PKGDIR[p] : "" }
+function resolve(p,   d) {
+  p = trim(p)
+  gsub(/^["\047]|["\047]$/, "", p)
+  if (substr(p, 1, 1) == "/") return norm(stripabs(p))
+  sub(/^\.\//, "", p)
+  d = pdir(ctx)
+  if (d != "" && index(p, d "/") != 1) p = d "/" p
+  return norm(p)
+}
+# A turbo task header "<pkg>:<task>" (pkg must be a known workspace package, or // for root tasks).
+function hdr(s,   i, p) {
+  if (s !~ /^[@A-Za-z0-9_.\/-]+:[A-Za-z0-9:_-]+$/ || s ~ /:$/) return ""
+  i = index(s, ":"); p = substr(s, 1, i - 1)
+  if ((p in PKGDIR) || p == "//") return p
+  return ""
+}
+function flush_node(   scope) {
+  if (!ndpend) return
+  ndpend = 0
+  if (ndtype == "subtestsFailed") { ndloc = ""; ndtype = ""; return }
+  if (ndloc != "") scope = resolve(ndloc)
+  else if (ndname ~ /^\/.*\.[cm]?[jt]sx?$/) { scope = resolve(ndname); ndname = "(file)" }
+  else scope = (pdir(ctx) != "" ? pdir(ctx) : ctx)
+  emit("nodetest", scope, ndname)
+  ndloc = ""; ndtype = ""
+  if (inblock ~ /^node:/) inblock = ""
+}
+function endblocks() {
+  flush_node()
+  inblock = ""; efile = ""; jfile = ""; xfile = ""; reach = 0; rfile = ""; disc = 0; nxfile = ""
+}
+function envhit(m) {
+  if (inblock != "") ENVB[m, inblock] = 1
+  else ENVO[m] = 1
+  ENVM[m] = 1
+}
+BEGIN {
+  while ((getline ml < MAPFILE) > 0) {
+    split(ml, a, "\t")
+    if (a[1] == "") continue
+    PKGDIR[a[1]] = a[2]; DIRPKG[a[2]] = a[1]; PKGRUN[a[1]] = a[3]
+  }
+  close(MAPFILE)
+  PKGDIR["//"] = ""
+  if (DEFPKG in DIRPKG) DEFPKG = DIRPKG[DEFPKG]
+  ctx = DEFPKG
+}
+{
+  line = $0
+  if (line ~ /^##\[(error|warning|notice)\]/) { sub(/^##\[[a-z]+\]/, "", line); anno = 1 } else anno = 0
+
+  # ---- CI framing: steps and turbo task groups
+  if (line ~ /^##\[group\]Run /) { endblocks(); ctx = DEFPKG; step = substr(line, 14); next }
+  if (line ~ /^##\[endgroup\]/) { endblocks(); ctx = DEFPKG; next }
+  if (line ~ /^##\[group\]/) { p = hdr(substr(line, 10)); if (p != "") { endblocks(); ctx = p }; next }
+  if (line ~ /^##\[/) next
+  if (!anno) { p = hdr(line); if (p != "") { endblocks(); ctx = p; next } }
+  if (line ~ /^Process completed with exit code [1-9]/) { failstep = step; next }
+
+  # ---- local framing: "<pkg>:<task>: …" (turbo stream) or "<dir> <script>: …" (pnpm -r).
+  # A prefixed line sets the package context for itself; the first unprefixed line after a run of
+  # prefixed ones is turbo output again, so the context falls back to --pkg.
+  pfxnow = 0
+  if (line ~ /^[@A-Za-z0-9_.\/-]+:[A-Za-z0-9:_-]+: / || line ~ /^[@A-Za-z0-9_.\/-]+:[A-Za-z0-9:_-]+:$/) {
+    i = index(line, ":"); p = substr(line, 1, i - 1); rest = substr(line, i + 1)
+    j = index(rest, ": "); if (j == 0) j = length(rest)
+    if ((p in PKGDIR) && substr(rest, 1, j - 1) ~ /^[A-Za-z0-9:_-]+$/) {
+      if (p != ctx) { endblocks(); ctx = p }
+      line = substr(rest, j + 2); pfxnow = 1
+    }
+  } else if (line ~ /^(apps|packages|tools)\/[A-Za-z0-9_.-]+ [A-Za-z0-9:_-]+: /) {
+    i = index(line, " "); d = substr(line, 1, i - 1)
+    if (d in DIRPKG) {
+      if (DIRPKG[d] != ctx) { endblocks(); ctx = DIRPKG[d] }
+      rest = substr(line, i + 1); line = substr(rest, index(rest, ": ") + 2); pfxnow = 1
+    }
+  }
+  if (!pfxnow && pfx) { endblocks(); ctx = DEFPKG }
+  pfx = pfxnow
+
+  # ---- environmental markers (any line, annotations included)
+  if (line ~ /Timed out after [0-9]+ ms while waiting for the WS endpoint/) envhit("puppeteer-ws-timeout")
+  else if (line ~ /Failed to launch the browser process/) envhit("puppeteer-launch")
+  else if (line ~ /(ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up).*registry\.(npmjs\.org|yarnpkg\.com)/ || line ~ /ERR_PNPM_(META_)?FETCH_/ || line ~ /request to https:\/\/registry\.npmjs\.org\/.* failed/) envhit("registry-network")
+  else if (line ~ /The runner has received a shutdown signal/ || line ~ /lost communication with the server/ || line ~ /The hosted runner encountered an error/) envhit("runner-lost")
+  else if (line ~ /No space left on device/) envhit("disk-full")
+  else if (line ~ /toomanyrequests: You have reached your pull rate limit/) envhit("docker-rate-limit")
+  else if (line ~ /The requested URL returned error: 5[0-9][0-9]/ || line ~ /fatal: unable to access .https:\/\/github\.com\//) envhit("github-unavailable")
+  else if (line ~ /has exceeded the maximum execution time/) envhit("job-timeout")
+  else if (line ~ /JavaScript heap out of memory/) envhit("heap-oom")
+  else if (line ~ /worker process \(pid=[0-9]+\) was terminated by another process: signal=SIG(SEGV|KILL|BUS)/) envhit("worker-crash")
+
+  # ---- turbo task summaries
+  if (line ~ /^Failed: +[^ ]/) {
+    s = line; sub(/^Failed: +/, "", s); n = split(s, parts, /, */)
+    for (i = 1; i <= n; i++) if (parts[i] ~ /#/) emit("task", trim(parts[i]), "")
+    next
+  }
+  if (match(line, /[@A-Za-z0-9_.\/-]+#[A-Za-z0-9:_-]+: command /)) {
+    s = substr(line, RSTART, RLENGTH); sub(/: command $/, "", s); emit("task", s, ""); next
+  }
+  if (anno && line ~ /^[@A-Za-z0-9_.\/-]+#[A-Za-z0-9:_-]+$/) { emit("task", line, ""); next }
+  if (line ~ /run failed/ && match(line, /[@A-Za-z0-9_.\/-]+#[A-Za-z0-9:_-]+/)) { emit("task", substr(line, RSTART, RLENGTH), ""); next }
+
+  # ---- node:test TAP
+  if (ndpend) {
+    if (line ~ /^ *location: /) { s = line; sub(/^ *location: *["\047]?/, "", s); sub(/["\047]$/, "", s); sub(/(:[0-9]+)+$/, "", s); ndloc = s; next }
+    if (line ~ /^ *failureType: /) { s = line; sub(/^ *failureType: *["\047]?/, "", s); sub(/["\047]$/, "", s); ndtype = s; next }
+    if (line ~ /^ *\.\.\.$/ && match(line, /^ */) && RLENGTH == ndind + 2) { flush_node(); next }
+    if (line ~ /^ *((not )?ok [0-9]+|# Subtest:|1\.\.[0-9]+$)/) flush_node()
+  }
+  if (line ~ /^ *not ok [0-9]+ /) {
+    s = line; match(s, /^ */); ind = RLENGTH
+    sub(/^ *not ok [0-9]+ *-? */, "", s)
+    if (s ~ / # (TODO|SKIP|todo|skip)/) next
+    flush_node()
+    ndpend = 1; ndind = ind; ndname = s; ndloc = ""; ndtype = ""; inblock = "node:" s
+    next
+  }
+  # node --test spec reporter ("failing tests:" section)
+  if (line ~ /^ *test at .*:[0-9]+:[0-9]+$/) { s = line; sub(/^ *test at /, "", s); sub(/^file:\/\//, "", s); sub(/(:[0-9]+)+$/, "", s); ntloc = s; next }
+  if (ntloc != "" && line ~ /^ *✖ .+ \([0-9.]+m?s\)$/) {
+    s = line; sub(/^ *✖ /, "", s); sub(/ \([0-9.]+m?s\)$/, "", s)
+    emit("nodetest", resolve(ntloc), s); ntloc = ""; next
+  }
+
+  # ---- vitest / jest
+  if (line ~ /^ *FAIL +[^ ]/) {
+    s = line; sub(/^ *FAIL +/, "", s); sub(/^\|[^|]*\| +/, "", s)
+    jfile = ""
+    if ((i = index(s, " > ")) > 0) {
+      f = resolve(substr(s, 1, i - 1)); t = substr(s, i + 3)
+      emit("vitest", f, t); FAILF[f] = 1; inblock = f
+    } else if (s ~ /^[^ ]+ \[ [^ ]+ \]$/) {
+      f = resolve(substr(s, 1, index(s, " ") - 1)); emit("vitest", f, "(file)"); FAILF[f] = 1; inblock = f
+    } else if (s ~ /^[^ ]+\.[A-Za-z0-9]+( \(.*\))?$/) {
+      f = s; sub(/ \(.*\)$/, "", f); f = resolve(f)
+      if (PKGRUN[ctx] == "vitest") { emit("vitest", f, "(file)"); FAILF[f] = 1 }
+      else { jfile = f; JF[f] = 1 }
+      inblock = f
+    }
+    next
+  }
+  if (line ~ /^ *PASS +[^ ]/) { jfile = ""; inblock = ""; next }
+  if (line ~ /^ +● /) {
+    s = line; sub(/^ +● /, "", s)
+    if (s ~ /^Console$/) next
+    gsub(/ › /, " > ", s)
+    f = (jfile != "") ? jfile : (pdir(ctx) != "" ? pdir(ctx) : ctx)
+    emit("jest", f, s); JE[f] = 1; inblock = f
+    next
+  }
+  if (line ~ /^ *⎯/ || line ~ /^ +Test (Files|Suites): /) { inblock = "" }
+  if (line ~ /^ *❯ [^ ]+ \([0-9]+ tests? \| [0-9]+ failed/) {
+    s = line; sub(/^ *❯ /, "", s); xfile = resolve(substr(s, 1, index(s, " ") - 1)); next
+  }
+  if (line ~ /^ (✓|↓) /) xfile = ""
+  if (xfile != "" && line ~ /^ +× /) {
+    s = line; sub(/^ +× /, "", s); sub(/ [0-9.]+m?s$/, "", s)
+    XT[++NX] = xfile; XTT[NX] = s; next
+  }
+  if (match(line, /This error originated in "[^"]+" test file/)) {
+    s = substr(line, RSTART + 26); s = substr(s, 1, index(s, "\"") - 1)
+    emit("vitest", resolve(s), "(unhandled error)"); next
+  }
+
+  # ---- tsc
+  if (match(line, /\([0-9]+,[0-9]+\): error TS[0-9]+:/) && RSTART > 1 && line !~ /^ /) {
+    f = substr(line, 1, RSTART - 1); match(line, /error TS[0-9]+/)
+    emit("ts", resolve(f), substr(line, RSTART + 6, RLENGTH - 6)); next
+  }
+  if (match(line, /:[0-9]+:[0-9]+ - error TS[0-9]+:/) && RSTART > 1 && line !~ /^ /) {
+    f = substr(line, 1, RSTART - 1); match(line, /error TS[0-9]+/)
+    emit("ts", resolve(f), substr(line, RSTART + 6, RLENGTH - 6)); next
+  }
+  if (line ~ /^error TS[0-9]+:/) {
+    match(line, /TS[0-9]+/); emit("ts", (pdir(ctx) != "" ? pdir(ctx) : "(global)"), substr(line, RSTART, RLENGTH)); next
+  }
+
+  # ---- next build
+  if (line ~ /^\.\/[^ ]+:[0-9]+:[0-9]+$/) { nxfile = line; sub(/(:[0-9]+)+$/, "", nxfile); next }
+  if (nxfile != "" && line ~ /^Type error: /) { emit("build", resolve(nxfile), "type-error"); nxfile = ""; next }
+  if (nxfile != "" && line ~ /^Module not found: /) { emit("build", resolve(nxfile), "module-not-found"); nxfile = ""; next }
+
+  # ---- eslint stylish
+  if (line ~ /^\/[^ ]*\.[A-Za-z0-9]+$/) { efile = resolve(line); next }
+  if (efile != "" && line ~ /^ +[0-9]+:[0-9]+ +error +/) {
+    r = "(no-rule)"
+    if (match(line, /  [@A-Za-z0-9\/_.-]+$/)) r = trim(substr(line, RSTART))
+    emit("eslint", efile, r); next
+  }
+  if (line ~ /^✖ [0-9]+ problems?/) { efile = ""; next }
+
+  # ---- prettier --check
+  if (line ~ /^\[warn\] [^ ]+$/) { emit("prettier", resolve(substr(line, 8)), ""); next }
+  if (line ~ /^\[error\] [^ :]+: /) { s = substr(line, 9); emit("prettier", resolve(substr(s, 1, index(s, ":") - 1)), "error"); next }
+
+  # ---- check-cross-app-reach
+  if (line ~ /^no-cross-app-reach: found cross-app/) { reach = 1; next }
+  if (line ~ /^no-cross-app-reach: KNOWN_VIOLATIONS lists an entry/) { reach = 2; next }
+  if (reach == 1 && line ~ /^  [^ ]+:[0-9]+  \(in /) { rfile = line; sub(/^  /, "", rfile); sub(/:[0-9]+  \(in .*$/, "", rfile); next }
+  if (reach == 1 && rfile != "" && match(line, /apps\/[A-Za-z0-9_.-]+ reaching apps\/[A-Za-z0-9_.-]+/)) {
+    s = substr(line, RSTART, RLENGTH); sub(/ reaching /, "->", s); emit("reach", rfile, s); rfile = ""; next
+  }
+  if (reach == 1 && rfile != "" && match(line, /packages\/\* must not reach apps\/\* \(here: apps\/[A-Za-z0-9_.-]+/)) {
+    s = substr(line, RSTART, RLENGTH); sub(/^.*here: /, "", s); emit("reach", rfile, "packages->" s); rfile = ""; next
+  }
+  if (reach == 2 && line ~ /^  - [^ ]+$/) { s = substr(line, 5); sub(/:[^:\/]*$/, "", s); emit("reach", s, "stale-allowlist"); next }
+  if (reach && line ~ /^(Fix:|\[ELIFECYCLE\])/) { reach = 0; rfile = "" }
+
+  # ---- theme:check ratchet
+  if (line ~ /theme ratchet FAIL — /) {
+    s = line; sub(/^.*theme ratchet FAIL — /, "", s); n = split(s, parts, /, /)
+    for (i = 1; i <= n; i++) { split(trim(parts[i]), w, " "); if (w[1] != "") emit("theme", w[1], "") }
+    next
+  }
+  if (line ~ /^[A-Za-z0-9_.]+ +.* FAIL — (above baseline|missing from baseline|scanner produced no number)/) {
+    split(line, w, " "); emit("theme", w[1], ""); next
+  }
+
+  # ---- aimock AG-UI smoke (scripts/aimock-agui-smoke.mjs); run ids in container names -> N
+  if (line ~ /^AIMock AG-UI smoke failed: /) {
+    s = substr(line, 28); gsub(/[0-9]+/, "N", s); emit("smoke", "aimock-agui", clean(s, 120)); next
+  }
+
+  # ---- test:discovery
+  if (line ~ /^\[test-discovery\] [0-9]+ problem\(s\) found:/) { disc = 1; dpara = 1; next }
+  if (disc) {
+    if (line ~ /^(\[ELIFECYCLE\]|ERR_PNPM|Process completed)/) { disc = 0; next }
+    if (line ~ /^[ \t]*$/) { dpara = 1; next }
+    if (dpara) { emit("discovery", clean(line, 160), ""); dpara = 0 }
+    next
+  }
+}
+END {
+  flush_node()
+  for (i = 1; i <= NX; i++) if (!(XT[i] in FAILF)) emit("vitest", XT[i], XTT[i])
+  for (f in JF) if (!(f in JE)) emit("jest", f, "(file)")
+  for (m in ENVM) {
+    linked = 0
+    for (k in ENVB) { split(k, kk, SUBSEP); if (kk[1] == m) { b = kk[2]; if (b ~ /^node:/) b = ""; emit("env", m, b); linked = 1 } }
+    if (!linked) emit("env", m, "")
+  }
+  if (NONTASK == 0 && failstep != "") emit("step", failstep, "")
+  for (i = 1; i <= NOUT; i++) print OUT[i]
+}
+' | LC_ALL=C sort -u
+exit 0

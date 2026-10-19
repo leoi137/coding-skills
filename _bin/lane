@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# lane — one effort = one ticket + one branch + one worktree, registered machine-wide so concurrent
+# Claude sessions can see each other.
+#
+#   lane new <slug> --ticket CB-n [--size S|M|L] [--repo DIR] [--no-install]
+#        fetch origin/main → worktree .claude/worktrees/<slug> on new branch <slug> → copy the main
+#        checkout's .env*.local files → pnpm install (frozen, offline-first) → verify husky hook and
+#        noreply author email → .lane/ (git-excluded) → registry record. Prints how to enter it.
+#   lane enter <slug|path>      print the two steps that move a session into the lane
+#   lane list [--json]          registered lanes, owner liveness, PR/CI as last recorded
+#   lane gc [--apply]           classify every worktree; REMOVE only if its PR is merged/closed, the
+#                               tree is clean, every commit is on a remote, and nothing lives in it.
+#                               Dry run by default — the user approves before --apply.
+#   lane claim <name> / lane release <name>   atomic named claims (migration:0226, dev-stack, main-red:<sig>)
+#   lane stats [...]            first-push-green baseline (lane-stats)
+#
+# Entering a lane (verified 2026-10-19): EnterWorktree(path) only works once the session's cwd is
+# inside the owning repo — from the non-git launch dir it fails. So: Bash `cd <main checkout>` first,
+# then EnterWorktree(path). Inside, writes to main-checkout paths are blocked; lane artifacts live in
+# <worktree>/.lane/.
+set -uo pipefail
+
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/lib/common.sh" || exit 1
+
+REG="$LANES_HOME/registry"
+CLAIMS="$LANES_HOME/claims"
+
+usage() { sed -n '2,24p' "$0"; }
+
+reg_file() { printf '%s/%s.json' "$REG" "$1"; }
+
+# My Claude session (env set by Claude Code in every Bash call).
+my_session() { printf '%s' "${CLAUDE_CODE_SESSION_ID:-}"; }
+my_pid() { printf '%s' "${CLAUDE_PID:-}"; }
+my_peer_name() {
+  local p; p=$(my_pid)
+  [ -n "$p" ] && jq -r '.name // empty' "$HOME/.claude/sessions/$p.json" 2>/dev/null
+}
+
+cmd_new() {
+  local slug="" ticket="" size="" repo="$LANES_MAIN_CHECKOUT" install=1 wt common f rel email
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ticket) ticket="$2"; shift 2 ;;
+      --size) size="$2"; shift 2 ;;
+      --repo) repo="$2"; shift 2 ;;
+      --no-install) install=0; shift ;;
+      -*) lanes_die "unknown option $1" ;;
+      *) [ -z "$slug" ] && slug="$1" || lanes_die "one slug only"; shift ;;
+    esac
+  done
+  [ -n "$slug" ] || lanes_die "usage: lane new <slug> --ticket CB-n"
+  printf '%s' "$slug" | grep -Eq '^[a-z0-9][a-z0-9._-]{1,62}$' || lanes_die "slug must be lowercase letters, digits, . _ - (named after the effort, never the ticket)"
+  printf '%s' "$slug" | grep -Eiq '^[a-z]+-[0-9]+$' && lanes_die "slug '$slug' looks like a ticket id; name the branch after the effort"
+  [ -n "$ticket" ] || lanes_die "--ticket CB-n is required (one ticket per lane)"
+  case "$size" in ""|S|M|L) ;; *) lanes_die "--size must be S, M or L" ;; esac
+  repo=$(cd "$repo" 2>/dev/null && pwd -P) || lanes_die "repo not found"
+  [ -d "$repo/.git" ] || lanes_die "$repo is not a main checkout"
+  wt="$repo/.claude/worktrees/$slug"
+  [ -e "$wt" ] && lanes_die "$wt already exists — \`lane enter $slug\`"
+  git -C "$repo" show-ref --verify --quiet "refs/heads/$slug" && lanes_die "branch $slug already exists"
+  [ -f "$(reg_file "$slug")" ] && lanes_die "lane $slug is already registered"
+
+  echo "lane: fetching origin/main…" >&2
+  git -C "$repo" fetch -q origin main || lanes_die "git fetch origin main failed"
+  git -C "$repo" worktree add -q -b "$slug" "$wt" origin/main || lanes_die "git worktree add failed"
+  git -C "$wt" branch -q --unset-upstream 2>/dev/null
+
+  # identical env files in every lane keep turbo's globalDependencies hash (and the shared cache) stable
+  find "$repo" -maxdepth 3 -name '.env*.local' -type f -not -path '*/node_modules/*' -not -path '*/.claude/*' 2>/dev/null | while IFS= read -r f; do
+    rel="${f#"$repo"/}"
+    mkdir -p "$wt/$(dirname "$rel")" && cp -p "$f" "$wt/$rel"
+  done
+
+  common=$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir)
+  mkdir -p "$common/info" "$wt/.lane"
+  grep -qx '.lane/' "$common/info/exclude" 2>/dev/null || printf '.lane/\n' >> "$common/info/exclude"
+
+  if [ $install = 1 ]; then
+    echo "lane: pnpm install (frozen lockfile, offline-first)…" >&2
+    (cd "$wt" && pnpm install --frozen-lockfile --prefer-offline --reporter=silent) || lanes_warn "pnpm install failed — run it in $wt before gating"
+    # core.hooksPath=.husky/_ is relative: without it the pre-commit hook silently never runs
+    [ -f "$wt/.husky/_/pre-commit" ] || [ -f "$wt/.husky/_/h" ] || lanes_warn "husky hooks missing in $wt/.husky/_ — pre-commit (lint-staged, secretlint) will be skipped"
+  fi
+
+  email=$(git -C "$wt" config user.email)
+  case "$email" in *@users.noreply.github.com) ;; *) lanes_warn "git user.email is not a users.noreply.github.com address — set it before the first commit (no PII in commits)" ;; esac
+
+  jq -n --arg slug "$slug" --arg repo "$repo" --arg wt "$wt" --arg ticket "$ticket" --arg size "$size" \
+    --arg sid "$(my_session)" --arg pid "$(my_pid)" --arg peer "$(my_peer_name)" \
+    --arg base "$(git -C "$wt" rev-parse HEAD)" --arg now "$(lanes_now)" '
+    {v: 1, slug: $slug, repo: $repo, worktree: $wt, branch: $slug, ticket: $ticket,
+     size: (if $size == "" then null else $size end), stage: "scope",
+     owner: {sessionId: $sid, pid: (if $pid == "" then null else ($pid|tonumber) end), peerName: $peer},
+     pr: null, base: $base, packages: [], claims: [], ci: null, created: $now, heartbeat: $now}' \
+    | lanes_write "$(reg_file "$slug")"
+
+  echo "lane $slug ready: $wt (branch $slug from origin/main @ $(git -C "$wt" rev-parse --short HEAD), $ticket)"
+  enter_steps "$wt"
+}
+
+enter_steps() {
+  local wt="$1" main
+  main=$(lanes_main_of "$wt")
+  cat <<EOF
+To work in it from this session:
+  1. Bash: cd $main        (EnterWorktree needs the session inside the owning repo)
+  2. EnterWorktree(path: "$wt")
+Lane artifacts go in $wt/.lane/ (git-excluded).
+EOF
+}
+
+resolve_wt() {
+  local x="$1" f
+  if [ -d "$x" ]; then (cd "$x" && pwd -P); return; fi
+  f=$(reg_file "$x")
+  [ -f "$f" ] && { jq -r .worktree "$f"; return; }
+  [ -d "$LANES_MAIN_CHECKOUT/.claude/worktrees/$x" ] && { printf '%s\n' "$LANES_MAIN_CHECKOUT/.claude/worktrees/$x"; return; }
+  return 1
+}
+
+cmd_enter() {
+  local wt
+  wt=$(resolve_wt "${1:-}") || lanes_die "no lane or worktree '${1:-}'"
+  git -C "$(lanes_main_of "$wt")" worktree list --porcelain | grep -qx "worktree $wt" || lanes_die "$wt is not a registered git worktree"
+  enter_steps "$wt"
+}
+
+owner_state() {
+  local f="$1" sid pid
+  sid=$(jq -r '.owner.sessionId // empty' "$f"); pid=$(jq -r '.owner.pid // empty' "$f")
+  if [ -n "$pid" ] && lanes_pid_alive "$pid" && [ -f "$HOME/.claude/sessions/$pid.json" ] \
+     && [ "$(jq -r .sessionId "$HOME/.claude/sessions/$pid.json" 2>/dev/null)" = "$sid" ]; then
+    echo live
+  else
+    echo absent
+  fi
+}
+
+cmd_list() {
+  local f json=0
+  [ "${1:-}" = --json ] && json=1
+  mkdir -p "$REG"
+  if [ $json = 1 ]; then
+    for f in "$REG"/*.json; do [ -f "$f" ] && jq --arg o "$(owner_state "$f")" '. + {ownerState: $o}' "$f"; done | jq -s .
+    return
+  fi
+  ls "$REG"/*.json >/dev/null 2>&1 || { echo "no lanes registered"; return; }
+  for f in "$REG"/*.json; do
+    [ -f "$f" ] || continue
+    jq -r --arg o "$(owner_state "$f")" '"\(.slug)\t\(.ticket)\t\(.size // "-")\t\(.stage)\towner \(.owner.peerName // "?") (\($o))\tPR \(.pr // "-")\tCI \(.ci.state // "-")"' "$f"
+  done | column -t -s "$(printf '\t')"
+}
+
+# --- gc ----------------------------------------------------------------------------------------
+
+# cwd of every live process, once (lsof is the slow part)
+LIVE_CWDS=""
+load_live_cwds() {
+  LIVE_CWDS=$( { lsof -d cwd -Fn 2>/dev/null | sed -n 's/^n//p'; for f in "$HOME"/.claude/sessions/*.json; do [ -f "$f" ] && lanes_pid_alive "$(jq -r .pid "$f")" && jq -r .cwd "$f"; done; } | sort -u)
+}
+lives_in() {
+  printf '%s\n' "$LIVE_CWDS" | while IFS= read -r c; do
+    case "$c/" in "$1/"*) echo "$c"; break ;; esac
+  done
+}
+
+cmd_gc() {
+  local apply=0 repo="$LANES_MAIN_CHECKOUT" prs wt br pr state head prhead dirty safe live verdict why remote n_rm=0 n_keep=0 rows=""
+  [ "${1:-}" = --apply ] && apply=1
+  repo=$(cd "$repo" && pwd -P)
+  git -C "$repo" fetch -q origin main 2>/dev/null || lanes_warn "fetch failed; origin/main may be stale"
+  prs=$(gh pr list -R "$LANES_REPO_SLUG" --state all --limit 500 --json number,headRefName,headRefOid,state 2>/dev/null) || prs="[]"
+  load_live_cwds
+
+  while IFS= read -r wt; do
+    [ -n "$wt" ] || continue
+    case "$wt" in "$repo/.claude/worktrees/"*) ;; *) continue ;; esac
+    br=$(git -C "$wt" symbolic-ref -q --short HEAD 2>/dev/null || echo "")
+    head=$(git -C "$wt" rev-parse HEAD 2>/dev/null)
+    # the newest PR for the branch decides
+    pr=$(printf '%s' "$prs" | jq -c --arg b "$br" '[.[] | select($b != "" and .headRefName == $b)] | sort_by(.number) | last // empty')
+    state=$(printf '%s' "$pr" | jq -r '.state // empty' 2>/dev/null); state="${state:-NONE}"; prhead=$(printf '%s' "$pr" | jq -r '.headRefOid // empty')
+    dirty=$(git -C "$wt" status --porcelain 2>/dev/null | grep -v '^?? \.lane/' | grep -c .)
+    live=$(lives_in "$wt")
+
+    # Is every commit in HEAD preserved somewhere that outlives this worktree?
+    safe=0
+    case "$state" in
+      MERGED)
+        # squash merges leave the branch commits off main; HEAD == the merged head means nothing was added since
+        if [ "$head" = "$prhead" ] || git -C "$repo" merge-base --is-ancestor "$head" origin/main 2>/dev/null; then safe=1; fi ;;
+      CLOSED)
+        remote=$(git -C "$repo" ls-remote --heads origin "$br" 2>/dev/null | awk '{print $1}')
+        if [ -n "$remote" ] && git -C "$repo" cat-file -e "$remote" 2>/dev/null && git -C "$repo" merge-base --is-ancestor "$head" "$remote" 2>/dev/null; then safe=1; fi ;;
+    esac
+
+    verdict=KEEP; why=""
+    case "$state" in
+      MERGED|CLOSED) [ $safe = 1 ] || why="PR $state but HEAD has commits found nowhere else" ;;
+      NONE) why="no PR" ;;
+      *) why="PR $state" ;;
+    esac
+    [ -z "$br" ] && why="${why:+$why, }detached HEAD"
+    [ "$dirty" != 0 ] && why="${why:+$why, }$dirty uncommitted"
+    [ -n "$live" ] && { live="${live#"$wt"}"; why="${why:+$why, }in use (${live:-/})"; }
+    [ -z "$why" ] && verdict=REMOVE
+    if [ $verdict = REMOVE ]; then n_rm=$((n_rm+1)); else n_keep=$((n_keep+1)); fi
+    rows="$rows$verdict	${wt##*/}	${br:-(detached)}	$(printf '%s' "$pr" | jq -r '"#\(.number // "-")"' 2>/dev/null || echo -) $state	${why:-PR $state, clean, nothing unique, idle}
+"
+    if [ $apply = 1 ] && [ $verdict = REMOVE ]; then
+      if git -C "$repo" worktree remove "$wt"; then
+        git -C "$repo" branch -D "$br" >/dev/null 2>&1
+        rm -f "$(reg_file "${wt##*/}")"
+        echo "removed $wt ($br)" >&2
+      else
+        lanes_warn "git refused to remove $wt — left in place"
+      fi
+    fi
+  done < <(git -C "$repo" worktree list --porcelain | sed -n 's/^worktree //p')
+
+  printf '%s' "$rows" | sort | column -t -s "$(printf '\t')"
+  echo
+  echo "$n_rm removable, $n_keep kept."
+  if [ $apply = 1 ]; then
+    git -C "$repo" worktree prune
+    if [ -d "$HOME/.cache/turbo/amiara-stack" ]; then
+      find "$HOME/.cache/turbo/amiara-stack" -type f -mtime +14 -delete 2>/dev/null
+      echo "pruned shared turbo cache entries older than 14 days"
+    fi
+  else
+    echo "Dry run. After the user approves the REMOVE list: lane gc --apply"
+  fi
+}
+
+# --- claims ------------------------------------------------------------------------------------
+
+cmd_claim() {
+  local name="${1:-}" d
+  [ -n "$name" ] || lanes_die "usage: lane claim <name>"
+  printf '%s' "$name" | grep -Eq '^[A-Za-z0-9:._-]+$' || lanes_die "claim names: letters digits : . _ -"
+  d="$CLAIMS/$name"; mkdir -p "$CLAIMS"
+  if mkdir "$d" 2>/dev/null; then
+    jq -n --arg s "$(my_session)" --arg p "$(my_peer_name)" --arg pid "$(my_pid)" --arg t "$(lanes_now)" --arg l "${2:-}" \
+      '{session: $s, peer: $p, pid: $pid, lane: $l, claimed: $t}' | lanes_write "$d/owner.json"
+    echo "claimed $name"
+  else
+    echo "already claimed: $name by $(jq -r '"\(.peer // "?") (\(.lane // "-")) since \(.claimed)"' "$d/owner.json" 2>/dev/null)" >&2
+    return 1
+  fi
+}
+cmd_release() {
+  local name="${1:-}"
+  [ -n "$name" ] || lanes_die "usage: lane release <name>"
+  rm -rf "$CLAIMS/$name" && echo "released $name"
+}
+
+case "${1:-}" in
+  new) shift; cmd_new "$@" ;;
+  enter) shift; cmd_enter "$@" ;;
+  list|ls) shift; cmd_list "$@" ;;
+  gc) shift; cmd_gc "$@" ;;
+  claim) shift; cmd_claim "$@" ;;
+  release) shift; cmd_release "$@" ;;
+  stats) shift; exec "$LANES_BIN/lane-stats" "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *) lanes_die "unknown subcommand '$1' (lane --help)" ;;
+esac

@@ -1,0 +1,264 @@
+#!/bin/bash
+# lane-stats — how often recent amiara-stack PRs go green on their FIRST CI result.
+# Phase 0 of plan-pipeline v2: a reproducible baseline. `lane stats` execs this.
+#
+# Usage: lane-stats [--limit N] [--author LOGIN] [--json] [--refresh] [--by-branch]
+#   --limit N       the last N PRs by number, any state (default 45)
+#   --author LOGIN  count only LOGIN's PRs among those N (same fetch, same cache)
+#   --json          one JSON object (totals, per author, per size, red-first list, every PR)
+#   --refresh       ignore the cache (fresh results are written back)
+#   --by-branch     legacy attribution: every ci.yml pull_request run on the PR's branch, whenever it
+#                   ran. Reproduces the 2026-10-19 baseline (22/33) but is wrong when a branch name is
+#                   reused (#313 and #316 share claude/nice-ptolemy-7s02bm, so #316 inherits #313's F,F).
+#                   Never reads or writes the cache.
+#
+# Method
+#   runs         workflow .github/workflows/ci.yml, event pull_request, head branch = the PR's head
+#                branch, head repo = the PR's head repo.
+#   attribution  a run belongs to the PR when it was created while the PR was open:
+#                createdAt <= run.created_at <= closedAt (now, if open). ci.yml runs only for base main
+#                and GitHub allows one open PR per head/base pair, so this is unambiguous.
+#                Rejected: run.pull_requests[] (empty once a PR is closed) and head sha in the PR's
+#                commit list (force-pushes drop earlier heads: #292 would lose its two green runs).
+#   order        run created_at, oldest first.
+#   dropped      cancelled, skipped, neutral, stale, action_required (not a CI result).
+#   result       the run's latest attempt: success = S (green); failure, timed_out, startup_failure = F.
+#                S* = green only on a re-run of the same sha (attempt 1 failed). It counts green in the
+#                headline rate (the baseline's rule) and red in the "strict" line.
+#   first-push green  the first kept run is S. Pending = the first kept run has not finished.
+#   no CI        PRs with no attributed run (base not main, stacked PRs) are left out of every rate.
+#
+# Size class (L is checked first)
+#   L  additions + deletions > 600, or more than 3 packages
+#   S  <= 3 changed files, <= 1 package, and no file under packages/contracts, packages/db-schema,
+#      or a migrations/ or drizzle/ dir
+#   M  everything else
+#   package = the workspace dir a file lives in: apps/<x>, packages/<x>, tools/<x>, infra, e2e,
+#   deploy/IaC/pulumi (every amiara-stack workspace package sits at one of those). Root files
+#   (lockfile, .github, docs/) belong to no package.
+#
+# Cache  $LANES_HOME/cache/stats/pr-<N>.json, written only once the PR is closed or merged and every
+#   attributed run has completed; reused while the PR's state and updatedAt are unchanged, so open
+#   PRs are always refetched. Cost: 1 API call when fully cached; cold about 2 per PR (files, branch
+#   runs) plus 1 per green re-run. A re-run started after a PR closed is only seen with --refresh.
+# Fail-safe  a gh error for one PR marks it "unknown" and the report carries on.
+# bash 3.2 compatible (macOS /bin/bash); needs jq and an authenticated gh.
+
+set -uo pipefail
+. "$(dirname "$0")/lib/common.sh"
+lanes_need gh jq
+
+usage() { sed -n '4,13p' "$0" | sed 's/^# \{0,1\}//'; }
+
+LIMIT=45 AUTHOR="" JSON=0 REFRESH=0 BY_BRANCH=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --limit) [ $# -ge 2 ] || lanes_die "--limit needs a number"; LIMIT="$2"; shift 2 ;;
+    --limit=*) LIMIT="${1#*=}"; shift ;;
+    --author) [ $# -ge 2 ] || lanes_die "--author needs a login"; AUTHOR="$2"; shift 2 ;;
+    --author=*) AUTHOR="${1#*=}"; shift ;;
+    --json) JSON=1; shift ;;
+    --refresh) REFRESH=1; shift ;;
+    --by-branch) BY_BRANCH=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+case "$LIMIT" in ''|*[!0-9]*|0) lanes_die "--limit must be a positive integer" ;; esac
+
+SLUG="$LANES_REPO_SLUG"
+WORKFLOW="ci.yml"
+CACHE="$LANES_HOME/cache/stats"
+PARALLEL="${LANE_STATS_PARALLEL:-6}"
+NOW="$(lanes_now)"
+
+mkdir -p "$CACHE" || lanes_die "cannot create $CACHE"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/lane-stats.XXXXXX")" || lanes_die "mktemp failed"
+trap 'rm -rf "$TMP"' EXIT
+
+# --- the PR list (always live: it is what decides which cache entries are still valid) ---
+gh pr list -R "$SLUG" --state all --limit "$LIMIT" \
+  --json number,author,headRefName,headRepository,baseRefName,additions,deletions,changedFiles,state,createdAt,closedAt,updatedAt \
+  > "$TMP/list.json" 2> "$TMP/list.err" || lanes_die "gh pr list failed: $(head -c 300 "$TMP/list.err")"
+jq -c 'sort_by(-.number) | .[]' "$TMP/list.json" > "$TMP/list.ndjson" || lanes_die "bad PR list JSON"
+[ -s "$TMP/list.ndjson" ] || lanes_die "no PRs found in $SLUG"
+
+# Write {number, error} as the record for a PR whose fetch failed.
+fail_rec() { jq -n --argjson n "$1" --arg e "$2" '{number:$n, error:$e}' > "$3"; }
+
+# Fetch one PR's files and CI runs into $2 (a record); cache it when final.
+fetch_pr() {
+  local meta="$1" out="$2" n branch enc err="$2.err" files runs ids id c
+  n=$(jq -r .number <<<"$meta")
+  branch=$(jq -r .headRefName <<<"$meta")
+  enc=$(jq -rn --arg b "$branch" '$b|@uri')
+
+  files=$(gh api --paginate "repos/$SLUG/pulls/$n/files?per_page=100" --jq '.[].filename' 2>"$err") \
+    || { fail_rec "$n" "files: $(head -c 200 "$err" | tr '\n' ' ')" "$out"; return; }
+
+  runs=$(gh api --paginate "repos/$SLUG/actions/workflows/$WORKFLOW/runs?branch=$enc&event=pull_request&per_page=100" \
+           --jq '.workflow_runs[] | {id, created_at, status, conclusion, run_attempt, head_sha, head_repo: .head_repository.full_name}' 2>"$err") \
+    || { fail_rec "$n" "runs: $(head -c 200 "$err" | tr '\n' ' ')" "$out"; return; }
+
+  # Attribute: same head repo, and (unless --by-branch) created while this PR was open.
+  runs=$(jq -s --argjson m "$meta" --arg now "$NOW" --argjson bybranch "$BY_BRANCH" '
+      map(select((.head_repo // $m.headRepository.nameWithOwner) == ($m.headRepository.nameWithOwner // .head_repo)))
+      | map(select($bybranch == 1 or (.created_at >= $m.createdAt and .created_at <= ($m.closedAt // $now))))
+      | sort_by(.created_at, .id) | map(del(.head_repo))' <<<"$runs") \
+    || { fail_rec "$n" "runs: unparseable API response" "$out"; return; }
+
+  # A run that ended green on a later attempt: was attempt 1 a failure? (one call per such run)
+  ids=$(jq -r '.[] | select(.run_attempt > 1 and .conclusion == "success") | .id' <<<"$runs")
+  for id in $ids; do
+    c=$(gh api "repos/$SLUG/actions/runs/$id/attempts/1" --jq '.conclusion // "unknown"' 2>"$err") \
+      || { fail_rec "$n" "attempt 1 of run $id: $(head -c 200 "$err" | tr '\n' ' ')" "$out"; return; }
+    runs=$(jq --argjson id "$id" --arg c "$c" 'map(if .id == $id then . + {first_attempt_conclusion: $c} else . end)' <<<"$runs")
+  done
+
+  printf '%s\n' "$files" | jq -R . | jq -s --argjson m "$meta" --argjson runs "$runs" --arg now "$NOW" '
+      { number: $m.number, state: $m.state, updated_at: $m.updatedAt, fetched_at: $now,
+        files: map(select(length > 0)), runs: $runs,
+        final: ($m.state != "OPEN" and ($runs | all(.status == "completed"))) }' > "$out.tmp" \
+    || { fail_rec "$n" "could not build record" "$out"; return; }
+  mv -f "$out.tmp" "$out"
+  rm -f "$err"
+  if [ "$BY_BRANCH" -eq 0 ] && jq -e .final "$out" >/dev/null 2>&1; then
+    lanes_write "$CACHE/pr-$n.json" < "$out" || lanes_warn "could not write cache for #$n"
+  fi
+}
+
+# --- per-PR records: cache hits copied, misses fetched $PARALLEL at a time ---
+running=0
+while IFS= read -r meta; do
+  n=$(jq -r .number <<<"$meta")
+  rec="$TMP/rec-$n.json"
+  cf="$CACHE/pr-$n.json"
+  if [ "$REFRESH" -eq 0 ] && [ "$BY_BRANCH" -eq 0 ] && [ -f "$cf" ] \
+     && jq -e --argjson m "$meta" '.final == true and .state == $m.state and .updated_at == $m.updatedAt' "$cf" >/dev/null 2>&1; then
+    cp "$cf" "$rec"
+    continue
+  fi
+  fetch_pr "$meta" "$rec" &
+  running=$((running + 1))
+  if [ "$running" -ge "$PARALLEL" ]; then wait; running=0; fi
+done < "$TMP/list.ndjson"
+wait
+
+# A record that never got written (killed job) is an unknown, never a silent gap.
+while IFS= read -r meta; do
+  n=$(jq -r .number <<<"$meta")
+  [ -s "$TMP/rec-$n.json" ] || fail_rec "$n" "no record produced" "$TMP/rec-$n.json"
+done < "$TMP/list.ndjson"
+
+# --- aggregate ---
+jq -s '.' "$TMP"/rec-*.json > "$TMP/recs.json" || lanes_die "bad record JSON"
+jq -n --slurpfile list "$TMP/list.json" --slurpfile recs "$TMP/recs.json" \
+      --arg slug "$SLUG" --arg now "$NOW" --arg author "$AUTHOR" \
+      --argjson limit "$LIMIT" --argjson bybranch "$BY_BRANCH" '
+  def letter: if . == "success" then "S"
+              elif . == "failure" or . == "timed_out" or . == "startup_failure" then "F"
+              else null end;
+  def pkg: if test("^(apps|packages|tools)/[^/]+/") then (split("/")[0:2] | join("/"))
+           elif test("^deploy/IaC/pulumi/") then "deploy/IaC/pulumi"
+           elif test("^(infra|e2e)/") then split("/")[0]
+           else empty end;
+  def rate(g; t): if t > 0 then ((100 * g / t) + 0.5 | floor) else null end;
+  def tally: { total: length, green: map(select(.first_green)) | length,
+               strict_green: map(select(.first_green and (.first_green_on_rerun | not))) | length }
+             | . + { rate: rate(.green; .total), strict_rate: rate(.strict_green; .total) };
+
+  ($recs[0] | map({key: (.number | tostring), value: .}) | from_entries) as $byn
+  | [ $list[0] | sort_by(-.number) | .[] | . as $m | $byn[$m.number | tostring] as $r
+      | ($r.files // []) as $files
+      | ([$files[] | pkg] | unique) as $pkgs
+      | ($m.additions + $m.deletions) as $lines
+      | any($files[]; test("^packages/(contracts|db-schema)/") or test("(^|/)(migrations|drizzle)/")) as $sensitive
+      | ([($r.runs // [])[]
+          | select(.status != "completed" or (.conclusion | letter) != null)
+          | . + { mark: (if .status != "completed" then "P"
+                         else (.conclusion | letter)
+                              + (if .conclusion == "success" and ((.first_attempt_conclusion // "") | letter) == "F"
+                                 then "*" else "" end) end) } ]) as $kept
+      | (if $r.error then "unknown"
+         elif ($r.runs | length) == 0 then "no_ci"
+         elif ($kept | length) == 0 then "no_result"
+         elif $kept[0].mark == "P" then "pending"
+         else "ok" end) as $status
+      | { number: $m.number, author: $m.author.login, branch: $m.headRefName, base: $m.baseRefName,
+          state: $m.state, created_at: $m.createdAt, closed_at: $m.closedAt,
+          additions: $m.additions, deletions: $m.deletions, changed_files: $m.changedFiles,
+          packages: $pkgs,
+          size: (if $r.error then null
+                 elif $lines > 600 or ($pkgs | length) > 3 then "L"
+                 elif $m.changedFiles <= 3 and ($pkgs | length) <= 1 and ($sensitive | not) then "S"
+                 else "M" end),
+          status: $status,
+          sequence: ($kept | map(.mark) | join(",")),
+          first_green: (if $status == "ok" then $kept[0].conclusion == "success" else null end),
+          first_green_on_rerun: (if $status == "ok" then $kept[0].mark == "S*" else null end),
+          runs: [($r.runs // [])[] | {id, created_at, status, conclusion, attempt: .run_attempt, head_sha}
+                 + (if .first_attempt_conclusion then {first_attempt_conclusion} else {} end)],
+          error: ($r.error // null) } ] as $all
+  | ($all | map(select($author == "" or (.author | ascii_downcase) == ($author | ascii_downcase)))) as $prs
+  | ($prs | map(select(.status == "ok"))) as $ok
+  | { repo: $slug, generated_at: $now,
+      window: { limit: $limit, author: (if $author == "" then null else $author end),
+                from: ($all | map(.number) | min), to: ($all | map(.number) | max) },
+      method: { workflow: ".github/workflows/ci.yml", event: "pull_request",
+                attribution: (if $bybranch == 1 then "branch (legacy: every run on the head branch)"
+                              else "head branch + head repo, run created while the PR was open" end),
+                dropped: ["cancelled", "skipped", "neutral", "stale", "action_required"],
+                first: "earliest kept run by created_at", green: "conclusion success (latest attempt)",
+                strict: "a first run green only on a re-run (attempt 1 failed) counts red",
+                size: "L: lines>600 or packages>3; S: files<=3, packages<=1, no contracts/db-schema/migration; else M" },
+      totals: ({ prs: ($prs | length) } + ($ok | tally)
+               + { no_ci: ($prs | map(select(.status == "no_ci")) | length),
+                   no_ci_base_not_main: ($prs | map(select(.status == "no_ci" and .base != "main")) | length),
+                   no_result: ($prs | map(select(.status == "no_result")) | length),
+                   pending: ($prs | map(select(.status == "pending")) | length),
+                   unknown: ($prs | map(select(.status == "unknown")) | length) }),
+      by_author: ($ok | group_by(.author) | map({ author: .[0].author } + tally)
+                  | sort_by(-.total, (.author | ascii_downcase))),
+      by_size: (["S", "M", "L"] | map(. as $s | { size: $s } + ($ok | map(select(.size == $s)) | tally))),
+      red_first: ($ok | map(select(.first_green | not)) | map({number, author, size, branch, sequence})),
+      green_on_rerun: ($ok | map(select(.first_green_on_rerun)) | map(.number)),
+      not_counted: ($prs | map(select(.status != "ok")) | map({number, status, base} + (if .error then {error} else {} end))),
+      prs: $prs }
+' > "$TMP/report.json" || lanes_die "aggregation failed"
+
+if [ "$JSON" -eq 1 ]; then cat "$TMP/report.json"; exit 0; fi
+
+jq -r '
+  def pad(n): tostring | if length < n then . + (" " * (n - length)) else . end;
+  def lpad(n): tostring | if length < n then (" " * (n - length)) + . else . end;
+  def frac(g; t): "\(g)/\(t)" | lpad(6);
+  def pct(r): if r == null then "  -" else "\(r)%" | lpad(4) end;
+  .totals as $t
+  | "lane stats · \(.repo) · PRs #\(.window.from)-#\(.window.to) (last \(.window.limit))"
+    + (if .window.author then " · author \(.window.author)" else "" end),
+    "  \($t.prs) PRs · \($t.total) with a CI result · \($t.no_ci) without CI runs (\($t.no_ci_base_not_main) not based on main)"
+    + (if $t.no_result > 0 then " · \($t.no_result) all-cancelled" else "" end)
+    + (if $t.pending > 0 then " · \($t.pending) pending" else "" end)
+    + (if $t.unknown > 0 then " · \($t.unknown) unknown" else "" end),
+    "  method: ci.yml pull_request runs, \(.method.attribution); cancelled/skipped dropped; first = earliest; green = success",
+    "",
+    "first-push green  \(frac($t.green; $t.total))  \(pct($t.rate))",
+    "  strict          \(frac($t.strict_green; $t.total))  \(pct($t.strict_rate))"
+    + (if (.green_on_rerun | length) > 0
+       then "   S* = green only on a re-run: " + (.green_on_rerun | map("#\(.)") | join(" "))
+       else "" end),
+    "",
+    "by author",
+    (.by_author[] | "  \(.author | pad(14)) \(frac(.green; .total))  \(pct(.rate))"),
+    "",
+    "by size (L: >600 lines or >3 pkgs · S: <=3 files, <=1 pkg, no contracts/db-schema/migration · else M)",
+    (.by_size[] | "  \(.size)               \(frac(.green; .total))  \(pct(.rate))"),
+    "",
+    "red first result (\(.red_first | length))",
+    (.red_first[] | "  #\(.number)  \(.size)  \(.author | pad(11)) \(.branch | pad(44)) \(.sequence)"),
+    (if (.not_counted | map(select(.status == "unknown" or .status == "pending")) | length) > 0 then
+       "", "not counted",
+       (.not_counted[] | select(.status == "unknown" or .status == "pending")
+        | "  #\(.number)  \(.status)" + (if .error then "  \(.error)" else "" end))
+     else empty end)
+' "$TMP/report.json"

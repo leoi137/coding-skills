@@ -71,7 +71,7 @@ gate_edit() {
   deny "Linear gate: no ticket is bound to this session for $root (you are editing $rel). Every change in this repo belongs to a Linear ticket.
 
 Load the \`ticket\` skill and resolve one before editing:
-- The user named a ticket, or the plan's Snapshot line names one → verify it with get_issue, then bind it.
+- The user named a ticket, or the lane's .lane/PLAN.md names one → verify it with get_issue, then bind it.
 - Otherwise find candidates and ask the user once with AskUserQuestion: continue an existing ticket, create a new one, or no ticket for this session.
 - Cannot ask the user (subagent or background run)? Stop and report that this work needs a ticket.
 

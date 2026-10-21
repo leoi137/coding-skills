@@ -1,67 +1,77 @@
 ---
-name: execute-plan
-description: Implement a ready plans/TODO_<feature>.md plan as a sequence of coherent, verifiable units — grounding each change against live code, validating it, ticking the checklist, and checkpointing the manifest as it goes. Resumable from a fresh session. Preserves other sessions' work, never commits. Use after /write-plan.
+name: build
+description: Implement an approved .lane/PLAN.md unit by unit inside its lane — ground each change against live code, see its test go red, make it green, run gate unit, commit it with the ticket ID — then gate push, push, open a draft PR on the first push, and keep CI green in the background. Resumable from a fresh session. Never marks the PR ready, never merges. Use after /scope.
 ---
 
-# execute-plan
+# build
 
-**Read `~/.claude/skills/_shared/pipeline-contract.md` first** — it defines the TODO schema, manifest format, model rule, and universal rules. Stage 3 of the pipeline. The checklist is how you stay on track; the uncommitted working-tree diff is how the user reads your work.
+**Read `~/.claude/skills/_shared/pipeline-contract.md` first** — lanes, gates, the commit policy, CI classes and the PLAN.md schema live there. Stage 2. The plan is how you stay on track; the commits are how the user reads your work.
 
-Goal: turn an approved plan into working, locally-verified code with **tight feedback loops** and **no sidetracking** — leaving the TODO checkpointed well enough that a fresh session could take over after any unit.
-
-> **Model:** subagents run on the session's model (the agent-guard hook enforces it). But **use deterministic tools for retrieval** (grep / read / test runs); spend a subagent only on *judgment* ("which of these implementations is live at runtime?"), never on "is this symbol used" (that's grep). Full policy in the contract.
+Goal: turn the approved plan into **small green commits and a draft PR whose CI is green**, with tight feedback loops and no sidetracking.
 
 ## Preconditions
 
-- A `plans/TODO_<feature>.md` with `Status: Ready` (or `In progress` when resuming) and no open blocking decisions. Else stop and say so.
-- Read the whole plan first. Ambiguous but safe → state the assumption, proceed. Ambiguous in a way that changes behavior / architecture / data / contracts / security / scope → ask one consolidated question, wait.
-- **Drift check (read-only):** compare the plan's `Snapshot` sha to current HEAD. Moved? Spot-check the plan's cited symbols still exist; if the plan is materially stale, stop and flag rather than coding against it.
-- **Session board (contract §Session board):** read `plans/SESSIONS.md`, then set this plan's section to `Stage: execute` and claim the plan's `## Files`. Another plan claims an overlapping file → stop and surface before touching it.
-- **Ticket (repos with `.claude/linear.json`):** the plan's `## Snapshot` names `ticket: <ID>` → bind it before the first edit (`~/.claude/skills/ticket/bin/ticket bind <ID> …`, then move it to the started status per the `ticket` skill), with no question. It names none → resolve one through the `ticket` skill first (the gate would stop the first edit anyway).
-- Set `Status: In progress` when you start.
+- You are inside the lane's worktree (`lane here`); if not, enter it (contract: `cd` main checkout, then `EnterWorktree(path)`).
+- `.lane/PLAN.md` says `Approved: yes` and has no `(blocking)` open question. Otherwise stop and say so — the approval is what authorizes commits and pushes.
+- Ticketed repo: the plan's ticket is bound in this session (`ticket show`); if not, bind it with no question, then move it to the started status per the `ticket` skill.
+- `git config user.email` is a `users.noreply.github.com` address; if not, set it repo-local before the first commit (`/commit-push` shows how).
+- Read the whole plan, and `.lane/research.md`'s key-file map if there is one — don't re-scout. Ambiguous but safe → state the assumption and proceed. Ambiguous in a way that changes behavior, data, contracts, security or scope → one consolidated question.
+- `lane set <slug> stage=build`.
 
-## Resume — fresh session, partially-ticked plan
+## Resume — fresh session, partly built
 
-This skill must be operable from the artifacts alone. If the checklist is already partially ticked: re-run the drift check, read the `## Changed manifest` so far, spot-check the last ticked unit's Verify still passes, then continue from the **first unticked item**. Never redo ticked work; never trust an unticked box was "probably done."
+Committed units are done: `git log --oneline origin/main..HEAD` against the plan's ticked units. Continue from the **first unticked unit**. Uncommitted changes in the worktree belong to the unit in progress — finish or redo that unit, never discard them silently.
 
-## Baseline — before touching code
+## Baseline
 
-Capture it so you never blame your change for someone else's mess: current branch/sha, dirty worktree, and the pre-existing pass/fail of the plan's validation commands. **Never "fix" a failure that was already there**, and never attribute a baseline failure to your work. Note which files the worktree already has modified — other sessions share this tree.
+`main-health` once: anything already red on main is not yours to fix and not yours to be blamed for. If `origin/main` moved since the plan's Base sha, spot-check (grep) that the plan's symbols still exist; materially stale → stop and flag.
 
-## The loop — one coherent unit at a time
+## The loop — one unit = one commit
 
-A **unit** is the smallest change that reaches a valid, testable state — it may span several files (model + service + test) that must move together. Group by "valid intermediate state," not by file. For each unit, in dependency order:
+For each unit, in order:
 
-1. **Announce** in one line — the behavior + primary symbols.
-2. **Ground at point of use — region, not file.** Grep for the symbol, then read its surrounding region (scoped offset/limit); whole-file reads only under ~400 lines. Confirm the plan's claim holds (symbol exists, signature matches, wiring is as assumed). **A mismatch *is* the "plan is wrong" trigger** → Divergence. This catches phantom symbols *before* you write, not after.
-3. **Write the smallest complete change.** Idiomatic, minimally scoped, no dead code / debug output / leftover TODOs. Match the neighbors' *structural* conventions — but don't propagate a local bad pattern into new code; if the surrounding code actively fights the change, flag it rather than silently picking a side.
-4. **Test red-before-green.** Write the test from the plan's *intended behavior* (the acceptance criterion — the external spec), and **see it fail first.** A test that never went red can't prove the feature works (same mind wrote code + test → they agree by construction). Then make it pass. Never weaken an assertion to get green.
-5. **Inspect the scoped diff.** Confirm the unit contains *only* intended changes — no unrelated edits, generated-file churn, debug lines, secrets, or dependency/lockfile drift. Fix accidents before continuing.
-6. **Validate.** Run the plan's commands, narrowest first. When the unit touches shared / widely-imported code, widen to known consumers, not just the new test. A completed unit must not be left broken.
-7. **Tick `[x]` AND checkpoint the manifest.** Tick *only after* Verify passes — that mark is the single source of "what's done." In the same edit, update the TODO's `## Changed manifest` (contract format: file — created|modified|deleted — symbols) with this unit's files. **After every unit, not at the end** — the manifest is `/review-plan`'s scope and your crash-recovery state. Refresh the session-board entry in the same breath (heartbeat + any files the unit added beyond the original claims). If the unit revealed a missed sub-task, add a new `[ ]` line under the same phase; don't silently do extra.
-8. **One-line status**, then the next unit.
+1. **Announce** in one line: the behavior and primary symbols.
+2. **Ground at point of use — region, not file.** Grep the symbol, read its surrounding region; whole files only under ~400 lines. A mismatch with the plan (missing symbol, different signature, other wiring) *is* the divergence trigger — see below.
+3. **Red first.** Write the unit's test from the acceptance criterion (the external spec, not your implementation) and run it: it must fail for the right reason. Record the failing line under `## Log` in PLAN.md. A test that never went red proves nothing.
+4. **Smallest complete change.** Idiomatic, minimally scoped; no dead code, debug output or leftover TODOs. Match the neighbors' conventions, but don't copy a local bad pattern into new code — flag it.
+5. **Green** — the unit's own `verify:` command from the plan passes — then `gate unit` (`run_in_background: true`; wait for the notification). Fix what it finds — including a slow-test flag (give the test an explicit timeout or make it faster) and suppressions without a `-- reason`. Never weaken an assertion to get green.
+6. **Inspect the diff:** only this unit's intent — no unrelated edits, generated churn, lockfile drift, secrets.
+7. **Commit:** `git add <this unit's paths>` → `git commit -m "<imperative subject> (CB-n)"` (match `git log` style; body only when the *why* isn't obvious). No attribution of any kind. Then tick the unit `[x]` in PLAN.md with its sha in `## Log`.
+8. One-line status, next unit.
 
-**Run to completion.** Execute every phase in sequence through to the Final pass in one go — never hand back mid-plan, never ask "should I proceed?". Phase boundaries (including any old `(Review checkpoint)` text left in a plan) are not stop points: run the boundary's `build + tests green` check and continue straight into the next phase. The only halts are a Material divergence or a genuinely blocking question. `/review-plan` runs once, by the user, after the whole plan is implemented.
+**Docs units** follow the repo's doc-map: edit a doc only where the change alters an invariant it records; verify against the code you just wrote; document the contract (what it guarantees, edge cases, why), not the implementation; one fact in one home, everything else links; keep indexes and cross-links current; use the repo's existing term for each concept; never touch a doc the repo marks frozen.
+
+**Run to completion.** Don't stop between units to ask "should I continue?" — the only halts are a material divergence, a blocking question, or three red CI cycles.
+
+## Push, draft PR, CI — in the background, not at the end
+
+- **Push early:** after the first unit that gives CI something real to check (usually the first or second), not after the last. CI's integration suite is the one gate you can't run locally — let it start.
+- **Before every push:** `gate push` (background) — and don't edit the lane until it reports, or it fails as stale. Red → fix, commit, rerun. It merges `origin/main` first; resolve a conflict by hand, keeping both sides' intent, then rerun. Before the first push also run `lane conflicts`.
+- **First push:** `git push -u origin <branch>`, then `gh pr create --draft --title "<subject> (CB-n)" --body "Part of CB-n …"` (one-paragraph summary + the acceptance criteria). `lane set <slug> pr=<n>`.
+- **Later pushes:** `git push` after `gate push` passes.
+- After each push: `~/.claude/skills/_bin/ci-watch <pr>` with `run_in_background: true`. On its result, act per the contract's CI classes — **ours**: fix, its test + `gate unit`, commit and **push at once** (the one push that doesn't wait for `gate push`), then run `gate push` in the background; **fixed-on-main**: merge `origin/main`, `gate push`, push; **flaky**: `gh run rerun <run> --failed` once; **inherited**: leave it, note it in `## Result`, tell the user.
+
+## Subagents
+
+Up to 3 implementer subagents may build file-disjoint units in parallel in this worktree (never `isolation: "worktree"`). Each gets a self-contained prompt: the unit's plan line, its files, the acceptance criterion, the test standards, and "write the test first, run only that test file and report its failing line before you implement; never run typecheck, lint or a whole test suite (the machine has 16 GB shared by several sessions — the parent runs the gate); don't commit; don't touch files outside your unit". You record the red line in `## Log`, review the result, run `gate unit`, and commit it yourself. Retrieval stays deterministic (grep / read / test runs); a subagent is for judgment or a whole unit, never "is this symbol used".
+
+## Follow-ups after the units
+
+Review comments, `/verify` findings handed back, or CI fixes after every unit is done: append a unit `- [ ] F<n> …` under `## Units` (the approval covers it) and run the same loop — red test, fix, `gate unit`, commit, push.
 
 ## Divergence
 
-- **Minor** (a local symbol / impl detail differs) → update the plan line to match reality, continue.
-- **Material** (architecture, acceptance criteria, public contract, persistence, security, rollout, or scope must change) → **stop, mark the plan `Blocked`, flag the user.** Don't silently redesign.
+- **Minor** (a local symbol or detail differs) → fix the plan line, continue.
+- **Material** (architecture, acceptance criteria, public contract, persistence, security, rollout or scope must change) → stop, mark the plan's Approval `pending`, explain, ask. Don't silently redesign.
 
-## Final pass
+## Done
 
-When the checklist is fully ticked:
-1. Re-check every acceptance criterion against the code.
-2. Run the plan's full relevant validation; compare to baseline (a pre-existing failure still failing is not yours).
-3. Verify the `## Changed manifest` is exact — every file created / modified / deleted and the symbols within them, including deletes. Append a **Result** section: status (`implemented & validated locally` — never "shipped"), exact validation commands + outcomes, deviations, pre-existing failures still present, deferred work. If a suite couldn't run, say so precisely — don't represent partial validation as success.
-4. Tell the user it's ready for `/review-plan`.
+Every unit ticked and committed, `gate push` green, pushed, CI green or red only on inherited/flaky failures. Write `## Result` in PLAN.md (gate summary and duration from `.lane/gate.json`, CI state, deviations, deferred work, anything not verified). `lane set <slug> stage=verify`, then tell the user it's ready for `/verify` — run it from the top-level session.
 
 ## Rules
 
-- **No commits, stashes, pushes, or destructive git — ever, here.** The working tree stays uncommitted for the user to read; the checklist is the tracker.
-- **Never overwrite or revert another session's / the user's pre-existing changes.** Where the plan's files overlap files already modified, patch with extra care.
-- **No unapproved side effects:** no deploy, no shared/prod DB migration, no dependency add/upgrade beyond what the plan requires, no real external calls with side effects.
-- **Never** `--no-verify`, suppress errors, or disable tests to force green.
-- **Keep edits in the main thread** (the user watches the diff). Delegate only auxiliary *judgment* reads.
-- **Read regions, not files.** Targeted grep + scoped reads are the default; the whole-file habit is the pipeline's biggest token leak.
-- **Think before each unit.** Elegance comes from understanding, not speed.
+- **Never merge, never mark the PR ready** — that's `/ship`, and merging is the team's.
+- Never `git add -A` / `.`, `--no-verify`, force-push, or destructive git. Never disable tests to force green.
+- No unapproved side effects: no deploys, no shared or prod DB migration, no dependency adds beyond the plan, no external calls with real effects.
+- Don't fix inherited failures or pre-existing problems outside the plan — report them.
+- Keep edits in the main thread unless a unit is delegated; read regions, not files.

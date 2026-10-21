@@ -1,60 +1,61 @@
 ---
-name: review-plan
-description: Independently review just the changes a plan made — scoped to that plan's manifest — against its acceptance criteria, for correctness, regressions, and scope creep. Fixes confirmed issues in place; never commits. Use after /execute-plan.
+name: verify
+description: Independently review a lane's whole branch against its plan — reviewers see the plan, the diff, the gate results and CI, never the implementer's reasoning — then fix confirmed defects as commits and record a verdict in .lane/review.md. Runs while CI runs. Top-level session only. Use after /build.
 ---
 
-# review-plan
+# verify
 
-**Read `~/.claude/skills/_shared/pipeline-contract.md` first** — it defines the manifest format, finding format, model rule, and universal rules. Stage 4 of the pipeline. Independence comes from reviewers seeing the *artifacts and code*, never the implementer's reasoning — this stage must work identically in a fresh session.
+**Read `~/.claude/skills/_shared/pipeline-contract.md` first** — the finding format, gates, CI classes and commit policy live there. Stage 3. Independence comes from what the reviewers see — artifacts and code, never the implementer's narrative — so this stage works the same in a fresh session.
 
-Goal: go over **only the changes this plan made**, confirm they actually satisfy the goal, **fix what's broken**, and don't get sidetracked.
+Goal: confirm the branch does what the plan's acceptance criteria say, **fix what's broken**, and don't get sidetracked.
 
-> **Model:** every reviewer runs on the session's model (the agent-guard hook enforces it; full policy in the contract). Since two copies of one model share blind spots, independence is bought via **adversarial framing + spec re-derivation** (below), not model diversity.
+## Preconditions
 
-## Scope — the plan's manifest, NOT the whole diff
+- **Run from the top-level session.** A fork or subagent can't spawn reviewers and would review single-pass; if you are one, stop and report "ready for /verify from the main session".
+- Inside the lane (`lane here`), `.lane/PLAN.md` with every unit ticked and a `## Result`. `lane set <slug> stage=verify`.
+- Ticketed repo: bind the plan's ticket if this session hasn't (`ticket show`; bind with no question) — fix commits need it.
 
-Multiple sessions share this worktree, so `git status` shows other plans' files too. Reviewing all of it *is* the sidetrack. Set this plan's session-board entry to `Stage: review` (contract §Session board) — and use the board's other sections to *name* which plan owns foreign hunks in shared files.
+## Scope — the branch, nothing else
 
-- Read the plan's **`## Changed manifest`** (files + symbols `/execute-plan` checkpointed). That set — intersected with the live working-tree diff — is the review target. Nothing else.- **Shared file** (this plan + another session both edited it): scope to the **hunks touching this plan's symbols** only. Leave the other hunks alone.
-- **Can't cleanly separate** this plan's changes from another's (interleaved edits in the same function)? → verdict `Blocked: target ambiguous`. Don't review or fix — a fix could clobber the other session's work.
+The review target is `git diff origin/main...HEAD` (the lane's own commits) against `.lane/PLAN.md`. Other branches, main's red, and pre-existing problems outside the diff are not in scope — report at most.
 
-## Validation — run once, read-only
+## Deterministic checks first (cheap, no reviewer needed)
 
-The orchestrator runs the plan's validation commands once and records exact command + result + counts. Compare to execute's claimed Result: **green-in-execute / red-in-review is itself a finding** (the tree or env moved). Passing tests are evidence, not proof. Don't run formatters / generators / migrations that mutate reviewed source.
+1. **Gate is current:** `.lane/gate.json` has `mode: push`, `result: pass`, and `head` equal to `git rev-parse HEAD`. Otherwise run `gate push` (background) and wait.
+2. **CI:** `gh pr checks <pr>`; if not finished, start `ci-watch <pr>` in the background and review in parallel — don't wait for it.
+3. **Plan vs commits:** every unit ticked has a commit; every acceptance criterion maps to a test that exists in the diff; the `## Log` shows each test went red first.
+4. **Gate warnings:** read `.lane/gate-logs/push-added-line-scan.log` warnings (wall clock without fake timers, real-time waits) — they're for the reviewers' checklist.
 
-## Reviewers — 3 in parallel, one message, each frontier-tier
+## Reviewers — on the session's model, in parallel, one message
 
-Each prompt is self-contained and **pastes** the goal, acceptance criteria, the Changed manifest, and the validation results — never "based on the conversation," never the implementer's narrative.
+Each prompt is self-contained and **pastes**: the goal, acceptance criteria and units from PLAN.md, the ticket's description, the diff (or the file list + the reviewer reads the files), the gate summary and CI state. Never "based on the conversation", never the implementer's transcript.
 
-- **A — Correctness vs the real goal (spec re-derivation).** *First derive what "done" should look like from the goal + research brief alone — independent of how the plan framed it — then check the code against that.* Catches a wrong plan faithfully implemented. Cover boundaries, null/error paths, auth, silent failures, state/ordering. Audit checklist items against code, not ticked boxes.
-- **B — Regressions & contracts.** For each changed symbol, find call sites + consumers (other layers/packages, serialization, generated code) and judge compatibility. Assess whether existing tests *meaningfully* exercise the change or pass vacuously.
-- **C — Quality, simplicity & scope.** Dead code, premature abstraction, unrelated refactoring, scope creep beyond the plan, comments that restate code, dependency churn. Frame this reviewer **adversarially**: "this code is wrong — find the input that breaks it."
+- **S lanes — one reviewer** doing both roles below.
+- **M lanes — two reviewers:**
+  - **R1 — correctness by re-derivation.** *First derive what "done" must look like from the goal, acceptance criteria and ticket alone — independent of how the plan framed it — then check the code against that.* Catches a wrong plan faithfully implemented. Boundaries, null/error paths, auth, silent failures, state and ordering.
+  - **R2 — regressions and test meaning, adversarially.** "This code is wrong — find the input that breaks it." For each changed symbol: call sites and consumers in other packages, serialization, generated code; whether the tests exercise the change or pass vacuously; test standards (frozen time for "today/this week", explicit timeouts, no real sleeps); scope creep, dead code, and whether the docs units match the code.
 
-**Output discipline:** findings only, each in the contract's finding format (severity · confidence · location · scenario · impact · fix direction, ≤150 words) — no narrative, no praise, no restating what's fine. Subagents drop their own low-confidence noise. An empty finding list is a valid output.
+**Output discipline:** findings only, in the contract's finding format — no narrative, no praise. An empty list is a valid answer.
 
-## Adjudicate, fix, report
+## Adjudicate and fix
 
-The parent reconciles — especially **disagreements** between reviewers (A says done, B's call-site sweep says a consumer breaks → that seam is the signal). For a blocker/high, pull the specific few lines the finding cites to confirm it (targeted point-of-use read — never the whole diff).
+- Reconcile, especially disagreements (R1 says done, R2's call-site sweep finds a broken consumer → that seam is the signal). For each blocker/high, read the few cited lines yourself to confirm.
+- **Confirmed defects → fix as commits** in the lane: smallest fix, its test red-then-green, `gate unit`, commit `fix: <what> (CB-n)`. Then `gate push` (background) and push — CI re-runs on the fix.
+- **Blocker/high fixes get one fresh re-check:** one new reviewer with just the finding and the fix commit. One pass, no loops.
+- **Decisions** (product, architecture, scope) → surface to the user; don't auto-decide.
+- **Pre-existing or out-of-diff defects** → report only. **Merely improvable code** → leave it (fix what's broken, never what's improvable).
 
-Then **fix what you find** (the user wants issues fixed, not just listed):
-- **Confirmed code-level defects** → fix in place (no commits), then re-run that finding's test/validation to prove the fix.
-- **Blocker/high fixes get one independent re-check:** spawn ONE fresh reviewer subagent with just the finding + the fixed hunks — the mind that wrote the fix doesn't get to be the only one approving it. One pass, no loops; med/low fixes need only their re-run validation.
-- **Anything needing a product / architecture / scope decision** → surface it, don't auto-decide. Auto-deciding those *is* sidetracking.
-- **Pre-existing unrelated defects** (outside the manifest) → report at most; never fix. Wandering into them is the sidetrack.
+## Verdict → `.lane/review.md`
 
-**Verdict** (not "ship" — review ≠ deploy). Failing required tests hard-gate to *not approved*:
-- **Approved** — criteria verified, validation green, no blocker/high left.
-- **Approved (fixed)** — issues found and fixed in place; validation green after the fix (and blocker/high fixes re-checked).
-- **Changes required** — a confirmed blocker/high needs a decision you can't make here; list it.
-- **Blocked: insufficient evidence** — ambiguous target or validation couldn't run.
+- **Approved** — every criterion verified, gate green, no blocker/high left.
+- **Approved (fixed)** — defects found and fixed as commits; gate green after; blocker/high fixes re-checked.
+- **Changes required** — a confirmed blocker/high needs a decision you can't make; list it.
+- **Blocked** — the gate or CI couldn't run, or the target is unclear.
 
-Report in chat + append a short `## Review` section to the TODO (verdict, what was fixed, anything surfaced; in checkpoint mode, note which phases the verdict covers). No separate artifact. On **Approved** / **Approved (fixed)**: full review → next stage is `/document-plan`; checkpoint review → `/execute-plan` resumes.
+`review.md`: `Reviewed: <git rev-parse HEAD after your fixes>`, verdict, each finding (fixed / surfaced / dismissed + why), fix commit shas, CI state at the end. Tell the user the verdict in chat. On Approved / Approved (fixed): `lane set <slug> stage=ship`, next is `/ship`.
 
 ## Rules
 
-- **Stay in scope:** the manifest ∩ diff, nothing else. The boundary is the anti-sidetrack mechanism.
-- **No commits, stashes, or pushes** — fixes land in the working tree for the user to read.
-- **Don't trust ticked boxes or passing tests** without code evidence.
-- **No blocking finding without evidence + scenario + impact.** ("No false positives" is unachievable; this is the real bar.) Distinguish introduced from pre-existing.
-- **Don't grade on a curve** — if it's solid, say so plainly and approve. Don't invent findings to look useful.
-- **Don't claim exhaustive coverage**; label uncertainty.
+- Stay in the branch diff. Don't trust ticked boxes or green tests without code evidence.
+- No blocking finding without evidence, scenario and impact. Distinguish introduced from pre-existing. Don't grade on a curve, don't invent findings, don't claim exhaustive coverage.
+- Never merge, never mark ready, never force-push.

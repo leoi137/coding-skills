@@ -16,7 +16,7 @@ Create `<repo-root>/.claude/linear.json`. Its presence is the switch: the gate, 
   "gitAutomations": false,
   "requiredLabelGroups": ["Type"],
   "optionalLabelGroups": [],
-  "exemptPaths": ["plans/SESSIONS.md", "research/**", ".claude/linear.json", ".claude/settings.local.json"]
+  "exemptPaths": [".claude/linear.json", ".claude/settings.local.json"]
 }
 ```
 

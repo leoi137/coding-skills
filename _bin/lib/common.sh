@@ -12,8 +12,18 @@
 
 LANES_HOME="${LANES_HOME:-$HOME/.claude/lanes}"
 LANES_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-LANES_REPO_SLUG="${LANES_REPO_SLUG:-amiara-ai/amiara-stack}"
-LANES_MAIN_CHECKOUT="${LANES_MAIN_CHECKOUT:-$HOME/Desktop/Resources/Amiara/amiara-stack}"
+# The repo comes from the cwd when it is inside a git checkout (any lane, any repo), else amiara-stack.
+_lanes_cwd_common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || _lanes_cwd_common=""
+if [ -z "${LANES_MAIN_CHECKOUT:-}" ]; then
+  if [ -n "$_lanes_cwd_common" ]; then LANES_MAIN_CHECKOUT=$(dirname "$_lanes_cwd_common")
+  else LANES_MAIN_CHECKOUT="$HOME/Desktop/Resources/Amiara/amiara-stack"; fi
+fi
+if [ -z "${LANES_REPO_SLUG:-}" ]; then
+  LANES_REPO_SLUG=$(git -C "$LANES_MAIN_CHECKOUT" remote get-url origin 2>/dev/null \
+    | sed -E 's#^(git@github\.com:|ssh://git@github\.com/|https://github\.com/)##; s#\.git$##')
+  case "$LANES_REPO_SLUG" in */*) ;; *) LANES_REPO_SLUG="amiara-ai/amiara-stack" ;; esac
+fi
+unset _lanes_cwd_common
 
 lanes_die() { printf '%s: %s\n' "${0##*/}" "$*" >&2; exit 1; }
 lanes_warn() { printf '%s: %s\n' "${0##*/}" "$*" >&2; }

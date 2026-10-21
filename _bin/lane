@@ -12,8 +12,13 @@
 #                               tree is clean, every commit is on a remote, and nothing lives in it.
 #                               Dry run by default — the user approves before --apply.
 #   lane here [--json]          the lane whose worktree holds the cwd (resume from a fresh session)
+#   lane conflicts [--files a,b]  this lane's (or the planned) files that another lane or open PR also
+#                               touches; exit 1 on overlap. contracts / db-schema / migrations are flagged.
+#   lane drop <slug>            abandon a lane: removes worktree, branch, record and claims — refused if
+#                               the tree is dirty or the branch has commits found on no remote
 #   lane set <slug> k=v …       update a record: stage=scope|build|verify|ship|shipped, pr=<n>, size=S|M|L
-#   lane claim <name> / lane release <name>   atomic named claims (migration:0226, dev-stack, main-red:<sig>)
+#   lane claim <name> [lane] / lane release <name>   atomic named claims (migration:0226, dev-stack,
+#                               main-red:<sig>); a claim whose session is gone is taken over
 #   lane stats [...]            first-push-green baseline (lane-stats)
 #
 # Entering a lane (verified 2026-10-19): EnterWorktree(path) only works once the session's cwd is
@@ -27,7 +32,7 @@ set -uo pipefail
 REG="$LANES_HOME/registry"
 CLAIMS="$LANES_HOME/claims"
 
-usage() { sed -n '2,26p' "$0"; }
+usage() { sed -n '2,30p' "$0"; }
 
 reg_file() { printf '%s/%s.json' "$REG" "$1"; }
 
@@ -54,9 +59,9 @@ cmd_new() {
   [ -n "$slug" ] || lanes_die "usage: lane new <slug> --ticket CB-n"
   printf '%s' "$slug" | grep -Eq '^[a-z0-9][a-z0-9._-]{1,62}$' || lanes_die "slug must be lowercase letters, digits, . _ - (named after the effort, never the ticket)"
   printf '%s' "$slug" | grep -Eiq '^[a-z]+-[0-9]+$' && lanes_die "slug '$slug' looks like a ticket id; name the branch after the effort"
-  [ -n "$ticket" ] || lanes_die "--ticket CB-n is required (one ticket per lane)"
   case "$size" in ""|S|M|L) ;; *) lanes_die "--size must be S, M or L" ;; esac
   repo=$(cd "$repo" 2>/dev/null && pwd -P) || lanes_die "repo not found"
+  if [ -f "$repo/.claude/linear.json" ] && [ -z "$ticket" ]; then lanes_die "--ticket CB-n is required in a ticketed repo (one ticket per lane)"; fi
   [ -d "$repo/.git" ] || lanes_die "$repo is not a main checkout"
   wt="$repo/.claude/worktrees/$slug"
   [ -e "$wt" ] && lanes_die "$wt already exists — \`lane enter $slug\`"
@@ -78,6 +83,16 @@ cmd_new() {
   mkdir -p "$common/info" "$wt/.lane"
   grep -qx '.lane/' "$common/info/exclude" 2>/dev/null || printf '.lane/\n' >> "$common/info/exclude"
 
+  # registered before the install, so a timeout mid-install leaves a lane `here`/`drop` can find
+  jq -n --arg slug "$slug" --arg repo "$repo" --arg wt "$wt" --arg ticket "$ticket" --arg size "$size" \
+    --arg sid "$(my_session)" --arg pid "$(my_pid)" --arg peer "$(my_peer_name)" \
+    --arg base "$(git -C "$wt" rev-parse HEAD)" --arg now "$(lanes_now)" '
+    {v: 1, slug: $slug, repo: $repo, worktree: $wt, branch: $slug, ticket: $ticket,
+     size: (if $size == "" then null else $size end), stage: "scope",
+     owner: {sessionId: $sid, pid: (if $pid == "" then null else ($pid|tonumber) end), peerName: $peer},
+     pr: null, base: $base, packages: [], claims: [], ci: null, created: $now, heartbeat: $now}' \
+    | lanes_write "$(reg_file "$slug")"
+
   if [ $install = 1 ]; then
     echo "lane: pnpm install (frozen lockfile, offline-first)…" >&2
     (cd "$wt" && pnpm install --frozen-lockfile --prefer-offline --reporter=silent) || lanes_warn "pnpm install failed — run it in $wt before gating"
@@ -88,14 +103,6 @@ cmd_new() {
   email=$(git -C "$wt" config user.email)
   case "$email" in *@users.noreply.github.com) ;; *) lanes_warn "git user.email is not a users.noreply.github.com address — set it before the first commit (no PII in commits)" ;; esac
 
-  jq -n --arg slug "$slug" --arg repo "$repo" --arg wt "$wt" --arg ticket "$ticket" --arg size "$size" \
-    --arg sid "$(my_session)" --arg pid "$(my_pid)" --arg peer "$(my_peer_name)" \
-    --arg base "$(git -C "$wt" rev-parse HEAD)" --arg now "$(lanes_now)" '
-    {v: 1, slug: $slug, repo: $repo, worktree: $wt, branch: $slug, ticket: $ticket,
-     size: (if $size == "" then null else $size end), stage: "scope",
-     owner: {sessionId: $sid, pid: (if $pid == "" then null else ($pid|tonumber) end), peerName: $peer},
-     pr: null, base: $base, packages: [], claims: [], ci: null, created: $now, heartbeat: $now}' \
-    | lanes_write "$(reg_file "$slug")"
 
   echo "lane $slug ready: $wt (branch $slug from origin/main @ $(git -C "$wt" rev-parse --short HEAD), $ticket)"
   enter_steps "$wt"
@@ -248,7 +255,7 @@ cmd_gc() {
     if [ $apply = 1 ] && [ $verdict = REMOVE ]; then
       if git -C "$repo" worktree remove "$wt"; then
         git -C "$repo" branch -D "$br" >/dev/null 2>&1
-        rm -f "$(reg_file "${wt##*/}")"
+        rm -f "$(reg_file "${wt##*/}")"; release_lane_claims "${wt##*/}"
         echo "removed $wt ($br)" >&2
       else
         lanes_warn "git refused to remove $wt — left in place"
@@ -272,14 +279,33 @@ cmd_gc() {
 
 # --- claims ------------------------------------------------------------------------------------
 
+# A claim name as a directory: kept as-is when safe, else "<prefix>:<hash>" (a CI signature has | / >).
+claim_key() {
+  local n="$1" prefix
+  if printf '%s' "$n" | grep -Eq '^[A-Za-z0-9:._-]{1,100}$'; then printf '%s' "$n"; return; fi
+  prefix="${n%%:*}"; [ "$prefix" = "$n" ] && prefix=claim
+  printf '%s:%s' "$(printf '%s' "$prefix" | tr -c 'A-Za-z0-9._-' '-')" "$(printf '%s' "$n" | shasum | cut -c1-12)"
+}
+
+# A claim's owner is alive while its Claude session runs (pid alive and still that session).
+claim_owner_alive() {
+  local f="$1/owner.json" pid sid
+  [ -f "$f" ] || return 0
+  pid=$(jq -r '.pid // empty' "$f"); sid=$(jq -r '.session // empty' "$f")
+  [ -n "$pid" ] || return 0
+  lanes_pid_alive "$pid" && [ "$(jq -r '.sessionId // empty' "$HOME/.claude/sessions/$pid.json" 2>/dev/null)" = "$sid" ]
+}
+
 cmd_claim() {
-  local name="${1:-}" d
-  [ -n "$name" ] || lanes_die "usage: lane claim <name>"
-  printf '%s' "$name" | grep -Eq '^[A-Za-z0-9:._-]+$' || lanes_die "claim names: letters digits : . _ -"
-  d="$CLAIMS/$name"; mkdir -p "$CLAIMS"
+  local name="${1:-}" d aside
+  [ -n "$name" ] || lanes_die "usage: lane claim <name> [lane]"
+  d="$CLAIMS/$(claim_key "$name")"; mkdir -p "$CLAIMS"
+  if [ -d "$d" ] && ! claim_owner_alive "$d"; then
+    aside="$d.stale.$$"; mv "$d" "$aside" 2>/dev/null && rm -rf "$aside" && echo "took over $name from a session that has ended" >&2
+  fi
   if mkdir "$d" 2>/dev/null; then
-    jq -n --arg s "$(my_session)" --arg p "$(my_peer_name)" --arg pid "$(my_pid)" --arg t "$(lanes_now)" --arg l "${2:-}" \
-      '{session: $s, peer: $p, pid: $pid, lane: $l, claimed: $t}' | lanes_write "$d/owner.json"
+    jq -n --arg n "$name" --arg s "$(my_session)" --arg p "$(my_peer_name)" --arg pid "$(my_pid)" --arg t "$(lanes_now)" --arg l "${2:-}" \
+      '{name: $n, session: $s, peer: $p, pid: $pid, lane: $l, claimed: $t}' | lanes_write "$d/owner.json"
     echo "claimed $name"
   else
     echo "already claimed: $name by $(jq -r '"\(.peer // "?") (\(.lane // "-")) since \(.claimed)"' "$d/owner.json" 2>/dev/null)" >&2
@@ -289,7 +315,66 @@ cmd_claim() {
 cmd_release() {
   local name="${1:-}"
   [ -n "$name" ] || lanes_die "usage: lane release <name>"
-  rm -rf "$CLAIMS/$name" && echo "released $name"
+  rm -rf "$CLAIMS/$(claim_key "$name")" && echo "released $name"
+}
+
+release_lane_claims() {
+  local d
+  for d in "$CLAIMS"/*/; do
+    [ -f "$d/owner.json" ] || continue
+    [ "$(jq -r '.lane // empty' "$d/owner.json")" = "$1" ] && rm -rf "$d"
+  done
+  return 0
+}
+
+# --- conflicts ---------------------------------------------------------------------------------
+
+cmd_conflicts() {
+  local planned="" top mine f other owt oslug prs hits=0 hard
+  [ "${1:-}" = --files ] && planned="$2"
+  top=$(lanes_toplevel) || lanes_die "run inside a lane's worktree"
+  top=$(cd "$top" && pwd -P)
+  if [ -n "$planned" ]; then mine=$(printf '%s' "$planned" | tr ',' '\n' | sed '/^$/d' | sort -u)
+  else mine=$( { git -C "$top" diff --name-only origin/main...HEAD; git -C "$top" status --porcelain | awk '{print $NF}'; } | grep -v '^\.lane/' | sort -u); fi
+  [ -n "$mine" ] || { echo "no files to compare"; return 0; }
+  {
+    for f in "$REG"/*.json; do
+      [ -f "$f" ] || continue
+      owt=$(jq -r .worktree "$f"); oslug=$(jq -r .slug "$f")
+      [ "$owt" = "$top" ] || [ ! -d "$owt" ] && continue
+      { git -C "$owt" diff --name-only origin/main...HEAD 2>/dev/null; git -C "$owt" status --porcelain 2>/dev/null | awk '{print $NF}'; } \
+        | grep -v '^\.lane/' | sort -u | while IFS= read -r l; do printf '%s\tlane %s\n' "$l" "$oslug"; done
+    done
+    prs=$(gh pr list -R "$LANES_REPO_SLUG" --state open --limit 100 --json number,headRefName,files 2>/dev/null) || prs="[]"
+    printf '%s' "$prs" | jq -r --arg mine "$(git -C "$top" symbolic-ref -q --short HEAD)" \
+      '.[] | select(.headRefName != $mine) | . as $p | .files[]? | "\(.path)\tPR #\($p.number) (\($p.headRefName))"'
+  } | sort -u > "${TMPDIR:-/tmp}/lane-conflicts.$$"
+  while IFS="$(printf '\t')" read -r f other; do
+    printf '%s\n' "$mine" | grep -qxF "$f" || continue
+    hard=""; case "$f" in packages/contracts/*|packages/db-schema/*|*/drizzle/*|*migration*) hard="  ← contract/schema/migration: coordinate before editing" ;; esac
+    printf 'OVERLAP %s ↔ %s%s\n' "$f" "$other" "$hard"; hits=$((hits+1))
+  done < "${TMPDIR:-/tmp}/lane-conflicts.$$"
+  rm -f "${TMPDIR:-/tmp}/lane-conflicts.$$"
+  [ $hits = 0 ] && { echo "no overlap with other lanes or open PRs"; return 0; }
+  return 1
+}
+
+# --- drop --------------------------------------------------------------------------------------
+
+cmd_drop() {
+  local slug="${1:-}" f wt br main unique
+  f=$(reg_file "$slug"); [ -f "$f" ] || lanes_die "no lane '$slug'"
+  wt=$(jq -r .worktree "$f"); br=$(jq -r .branch "$f")
+  if [ -d "$wt" ]; then
+    [ -z "$(git -C "$wt" status --porcelain | grep -v '^?? \.lane/')" ] || lanes_die "$wt has uncommitted changes — commit, move or discard them first (ask the user)"
+    unique=$(git -C "$wt" rev-list --count HEAD --not --remotes 2>/dev/null || echo 0)
+    [ "$unique" = 0 ] || lanes_die "$br has $unique commit(s) found on no remote — push them or get the user's OK first"
+    main=$(lanes_main_of "$wt")
+    git -C "$main" worktree remove "$wt" || lanes_die "git refused to remove $wt"
+    git -C "$main" branch -D "$br" >/dev/null 2>&1
+  fi
+  rm -f "$f"; release_lane_claims "$slug"
+  echo "dropped lane $slug"
 }
 
 case "${1:-}" in
@@ -297,6 +382,8 @@ case "${1:-}" in
   enter) shift; cmd_enter "$@" ;;
   list|ls) shift; cmd_list "$@" ;;
   here) shift; cmd_here "$@" ;;
+  conflicts) shift; cmd_conflicts "$@" ;;
+  drop) shift; cmd_drop "$@" ;;
   set) shift; cmd_set "$@" ;;
   gc) shift; cmd_gc "$@" ;;
   claim) shift; cmd_claim "$@" ;;

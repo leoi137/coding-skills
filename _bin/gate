@@ -98,6 +98,10 @@ defer_step() { say defer "$1" "$2"; record "$1" deferred 0 0 "" "$2"; }
 
 finish() {
   local dur sigs out
+  if [ -n "${STATE0:-}" ] && [ "$(lane_state)" != "$STATE0" ]; then
+    say FAIL "lane unchanged during the gate" "HEAD or the tree changed while it ran — rerun; don't edit a lane while its gate runs"
+    record "lane unchanged during the gate" fail 1 0 "" "changed under the gate"; FAILED=1
+  fi
   dur=$(( $(lanes_epoch) - STARTED ))
   sigs="[]"
   if [ -x "$LANES_BIN/ci-sigs" ]; then
@@ -138,6 +142,12 @@ if [ "$MODE" = push ]; then
 fi
 
 MB=$(git merge-base "$BASE_REF" HEAD) || lanes_die "no merge base with $BASE_REF"
+# what the gate checks; finish() fails the run if the lane changed underneath it
+lane_state() {
+  printf '%s %s %s %s' "$(git rev-parse HEAD)" "$(git status --porcelain | shasum | cut -c1-12)" "$(git diff HEAD | shasum | cut -c1-12)" \
+    "$(git ls-files -o --exclude-standard -z | xargs -0 cat 2>/dev/null | shasum | cut -c1-12)"
+}
+STATE0=$(lane_state)
 export TURBO_SCM_BASE="$MB" TURBO_SCM_HEAD=HEAD
 if [ "${GATE_SHARED_CACHE:-1}" = 1 ]; then export TURBO_CACHE_DIR="${TURBO_CACHE_DIR:-$HOME/.cache/turbo/amiara-stack}"; fi
 
@@ -364,8 +374,9 @@ if [ "$MODE" = push ]; then
   # nothing attributed, no PII author email, in what this push sends
   range="$MB..HEAD"; git rev-parse -q --verify '@{u}' >/dev/null && range='@{u}..HEAD'
   sweep="$LOGS/push-sweep.log"
-  { git log --no-merges -i --grep='co-authored-by' --grep='generated with' --format='%h attribution: %s' $range
-    git log --no-merges --format='%h %ae' $range | grep -v 'users\.noreply\.github\.com$' | sed 's/^/author email not noreply: /'; } > "$sweep" 2>&1
+  { git log -E -i --grep='co-authored-by' --grep='generated with[^[:alnum:]]*\[?claude' --format='%h attribution: %s' $range
+    git log --format='%h %ae' $range | grep -vE '(users\.noreply\.github\.com|noreply@github\.com)$' | sed 's/^/author email not noreply: /'
+    git log --format='%h %ce' $range | grep -vE '(users\.noreply\.github\.com|noreply@github\.com)$' | sed 's/^/committer email not noreply: /'; } > "$sweep" 2>&1
   if [ -s "$sweep" ]; then say FAIL "attribution/email sweep" "→ $sweep"; sed 's/^/         │ /' "$sweep"; record "attribution/email sweep" fail 1 0 "$sweep"; FAILED=1
   else say pass "attribution/email sweep"; record "attribution/email sweep" pass 0 0 "$sweep"; fi
 fi

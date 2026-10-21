@@ -17,7 +17,9 @@ usage() {
 ticket — bind this Claude Code session's work to a Linear ticket.
 
   ticket bind <ID> [--title T] [--url U] [--status S]   make <ID> the active ticket (the previous one moves to history)
-  ticket status <S>                                     record the active ticket's new Linear status
+  ticket status <S> [--summary X]                       record the active ticket's new Linear status
+  ticket log <ID> --status S [--title T] [--summary X]  record a status move on a ticket that isn't bound (e.g. /ticket sync)
+  ticket update [--date YYYY-MM-DD]                     rebuild and print that day's team-update file (default: today)
   ticket exempt [reason]                                the user chose "no ticket" for this session: lift the edit gate
   ticket unbind                                         drop the active ticket (kept in history)
   ticket show [--json]                                  this session's binding in the repo
@@ -26,6 +28,10 @@ ticket — bind this Claude Code session's work to a Linear ticket.
 
   --repo <dir>      repo to act on (default: walk up from the current directory to .claude/linear.json)
   --session <id>    session to act on (default: $CLAUDE_CODE_SESSION_ID)
+  --summary <text>  one plain-English line of what the ticket delivers, used in the team-update file
+
+Every bind/status/log appends to $TICKET_STATE_DIR/updates.jsonl and rewrites
+<updatesDir>/<local date>.md (updatesDir from .claude/linear.json; default <repo>/../team-updates).
 EOF
 }
 
@@ -36,7 +42,7 @@ cmd="${1:-}"
 [ -n "$cmd" ] || { usage; exit 1; }
 shift
 
-repo_arg="" session="${CLAUDE_CODE_SESSION_ID:-}" title="" url="" status="" json=0 limit=5
+repo_arg="" session="${CLAUDE_CODE_SESSION_ID:-}" title="" url="" status="" summary="" day="" json=0 limit=5
 args=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -45,6 +51,8 @@ while [ $# -gt 0 ]; do
     --title) title="${2:-}"; shift 2 ;;
     --url) url="${2:-}"; shift 2 ;;
     --status) status="${2:-}"; shift 2 ;;
+    --summary) summary="${2:-}"; shift 2 ;;
+    --date) day="${2:-}"; shift 2 ;;
     --limit) limit="${2:-5}"; shift 2 ;;
     --json) json=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -64,6 +72,67 @@ repo=$(ticket_canon "$found")
 
 if [ "$cmd" = config ]; then
   cat "$repo/.claude/linear.json"
+  exit 0
+fi
+
+# --- team-update file ---------------------------------------------------------------------------
+# updates.jsonl is an append-only log of status moves; <updatesDir>/<day>.md is rebuilt from it on
+# every move: each ticket moved that day, under its latest status, with its latest summary.
+updates_log="$TICKET_STATE_DIR/updates.jsonl"
+
+updates_dir() {
+  local d
+  d=$(jq -r '.updatesDir // empty' "$repo/.claude/linear.json" 2>/dev/null)
+  [ -n "$d" ] || d="$(dirname "$repo")/team-updates"
+  case "$d" in "~"*) d="$HOME${d#\~}" ;; /*) ;; *) d="$repo/$d" ;; esac
+  printf '%s\n' "$d"
+}
+
+render_update() {
+  # render_update <YYYY-MM-DD> — rewrite that day's file and print its path.
+  local d="$1" dir out tmp
+  dir=$(updates_dir); mkdir -p "$dir"
+  out="$dir/$d.md"
+  [ -f "$updates_log" ] || return 0
+  tmp=$(mktemp "$dir/.tmp.XXXXXX")
+  jq -s -r --arg r "$repo" --arg d "$d" --slurpfile cfg "$repo/.claude/linear.json" '
+    ($cfg[0].statuses // {}) as $s
+    | map(select(.repo == $r))
+    | (map(select((.summary // "") != "")) | group_by(.id) | map({key: .[0].id, value: (last.summary)}) | from_entries) as $sum
+    | (map(select((.title // "") != "")) | group_by(.id) | map({key: .[0].id, value: (last.title)}) | from_entries) as $ttl
+    | map(select(.date == $d)) | group_by(.id) | map(last) | sort_by(.at)
+    | map(. + {line: "- \(.id): \($sum[.id] // $ttl[.id] // "")"}) as $t
+    | [ ["Completed", ($s.done // "Done")],
+        ["In review", ($s.review // "In Review")],
+        ["In progress", ($s.started // "In Progress")] ]
+    | map(. as [$h, $st] | [$t[] | select(.status == $st) | .line] | select(length > 0) | "\($h):\n" + join("\n"))
+    | "# Team update — \($d)\n\n" + (if length == 0 then "_No ticket moves yet._" else join("\n\n") end)
+  ' "$updates_log" > "$tmp" || { rm -f "$tmp"; die "team-update render failed"; }
+  mv "$tmp" "$out"
+  printf '%s\n' "$out"
+}
+
+log_move() {
+  # log_move <id> <status> <title> <summary> — append one move, then rebuild today's file.
+  [ -n "$2" ] || return 0
+  mkdir -p "$TICKET_STATE_DIR"
+  jq -cn --arg at "$(now)" --arg date "$(date +%F)" --arg repo "$repo" --arg session "$session" \
+    --arg id "$1" --arg status "$2" --arg title "$3" --arg summary "$4" \
+    '{at: $at, date: $date, repo: $repo, session: $session, id: $id, status: $status, title: $title, summary: $summary}' \
+    >> "$updates_log"
+  render_update "$(date +%F)" > /dev/null || true
+}
+
+if [ "$cmd" = update ]; then
+  render_update "${day:-$(date +%F)}" | { read -r f; [ -n "$f" ] && cat "$f" && printf '\n(%s)\n' "$f"; }
+  exit 0
+fi
+
+if [ "$cmd" = log ]; then
+  id="${1:-}"
+  [ -n "$id" ] && [ -n "$status" ] || die "usage: ticket log <ID> --status S [--title T] [--summary X]"
+  log_move "$id" "$status" "$title" "$summary"
+  printf 'logged %s → %s\n' "$id" "$status"
   exit 0
 fi
 
@@ -123,12 +192,16 @@ case "$cmd" in
       | .repos[$r].exempt = null' \
       --arg id "$id" --arg title "$title" --arg url "$url" --arg status "$status"
     printf 'bound %s to this session in %s\n' "$id" "$repo"
+    a=$(jq -c --arg r "$repo" '.repos[$r].active' "$state")
+    log_move "$id" "$(jq -r '.status' <<<"$a")" "$(jq -r '.title' <<<"$a")" "$summary"
     ;;
   status)
     s="${1:-$status}"
     [ -n "$s" ] || die "usage: ticket status <status>"
     [ "$(ticket_binding_kind "$session" "$repo")" = active ] || die "no active ticket in $repo"
     apply '.repos[$r].active.status = $s' --arg s "$s"
+    a=$(jq -c --arg r "$repo" '.repos[$r].active' "$state")
+    log_move "$(jq -r '.id' <<<"$a")" "$s" "$(jq -r '.title' <<<"$a")" "$summary"
     printf '%s\n' "$(ticket_active_line "$session" "$repo")"
     ;;
   exempt)

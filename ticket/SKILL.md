@@ -69,7 +69,8 @@ Add `## Watch out` only for real traps. Link related tickets with `relatedTo` / 
 - Pass `--repo` whenever your shell's cwd isn't inside the repo. The gate's message prints the exact line to run.
 - If the ticket is in backlog or unstarted, move it to the started status (`save_issue` `state`) and assign it to `me` if unassigned. A ticket already In Review stays In Review: more commits on an open PR don't change its state.
 - `ticket exempt "<reason>"` only when the user chose "no ticket". It lifts the edit gate for this session, but **anything committed still needs an ID**: history is always ticketed.
-- `ticket status "<status>"` after every status change you make, so the status line stays true.
+- `ticket status "<status>"` after every status change you make, so the status line stays true. It also writes the user's **team-update file** (§6).
+- On the In Review and Done moves, add `--summary "<line>"`: one plain-English sentence of what the ticket delivers, for the user's end-of-day team update. Written for the team, not engineers: lead with the outcome, colons and commas for detail, no file names or jargon. E.g. `Notion works in actions: read pages, and save docs after you approve`. Once given it carries over to later moves, so Done needs it only if it changed.
 
 ## 3. While working: drift, switching, side findings
 
@@ -102,6 +103,12 @@ Run it when the user asks, or when you notice drift like a merged PR whose ticke
 - An open PR that isn't a draft → In Review.
 - No commits and no PR for a long time → ask whether it's still in progress.
 - Open items listed in a description → offer them as tickets.
+
+After each move you apply here, run `ticket log CB-n --status "<new status>" --title "<title>" --summary "<line>"` (the ticket isn't bound, so `ticket status` can't record it).
+
+## 6. The team-update file
+
+Every `bind`, `status` and `log` appends to `~/.claude/state/ticket/updates.jsonl` and rebuilds `<updatesDir>/<YYYY-MM-DD>.md` (`updatesDir` in `.claude/linear.json`; default `<repo>/../team-updates`): every ticket moved that day under its latest status, as **Completed / In review / In progress**, with its summary (or its title if none was given). The user pastes it as their daily team update. `ticket update [--date D]` rebuilds and prints a day. Never hand-edit the generated file; correct a line by logging the move again with a better `--summary`.
 
 ## Rules
 

@@ -1,6 +1,6 @@
 ---
 name: ticket
-description: Keep every change attached to a Linear ticket. Binds this session's work to an existing or new ticket, moves it through In Progress → In Review → Done at the real moments (first edit, PR opened, merge), and puts the ID where Linear's GitHub integration links it (commit subjects, PR title, `Fixes`/`Part of` in the PR body). Use when the Linear gate blocks an edit, commit or PR; when the user names a ticket (e.g. CB-123) or asks to switch tickets; when work drifts beyond the bound ticket; before opening a PR; when asked to create or file a ticket; or to reconcile Linear with GitHub (`/ticket sync`). Only active in repos that have `.claude/linear.json`.
+description: Keep every change attached to a Linear ticket. Binds this session's work to an existing or new ticket, moves it through In Progress → In Review → Done at the real moments (work starts, PR ready for review, merge), and puts the ID where Linear's GitHub integration links it (commit subjects, PR title, `Fixes`/`Part of` in the PR body). Use when the Linear gate blocks an edit, commit or PR; when the user names a ticket (e.g. CB-123) or asks to switch tickets; when work drifts beyond the bound ticket; before opening a PR; when asked to create or file a ticket; or to reconcile Linear with GitHub (`/ticket sync`). Only active in repos that have `.claude/linear.json`.
 ---
 
 # ticket
@@ -25,7 +25,7 @@ Session state lives outside the repo, per session: `bin/ticket` (below). Linear 
 
 Resolve once per piece of work, not per edit. Order:
 
-1. **The ticket is already known — bind it, no question.** The user named it ("work on CB-345"), or the plan's `## Snapshot` line says `ticket: CB-n`. Verify with `get_issue`: right team, not Canceled or Duplicate. If it's **Done**, don't reopen it: propose a follow-up ticket related to it, unless the user says the work is unfinished. If it's **assigned to someone else**, ask before taking it.
+1. **The ticket is already known — bind it, no question.** The user named it ("work on CB-345"), or the lane's `.lane/PLAN.md` heading names it (`# <effort> — CB-n`). Verify with `get_issue`: right team, not Canceled or Duplicate. If it's **Done**, don't reopen it: propose a follow-up ticket related to it, unless the user says the work is unfinished. If it's **assigned to someone else**, ask before taking it.
 2. **Otherwise collect candidates**, in this order of weight:
    - `bin/ticket recent`: what recent sessions in this repo were on. A ticket that spans several sessions continues here.
    - `list_issues` assignee `me`, state started or unstarted: the user's open work.
@@ -61,6 +61,8 @@ Resolve once per piece of work, not per edit. Order:
 Add `## Watch out` only for real traps. Link related tickets with `relatedTo` / `parentId` / `blockedBy`, not only in prose.
 
 ## 2. Bind: this session is now on the ticket
+
+In the pipeline, `/scope` does this step and then creates the effort's lane with `~/.claude/skills/_bin/lane new <slug> --ticket CB-n` (worktree and branch named after the effort). The binding is keyed to the main checkout, so it covers the lane's worktree too.
 
 ```bash
 ~/.claude/skills/ticket/bin/ticket bind CB-123 --title "<title>" --status "<status>" --url "<url>" [--repo <repo root>]

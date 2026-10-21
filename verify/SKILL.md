@@ -40,7 +40,7 @@ Each prompt is self-contained and **pastes**: the goal, acceptance criteria and 
 ## Adjudicate and fix
 
 - Reconcile, especially disagreements (R1 says done, R2's call-site sweep finds a broken consumer → that seam is the signal). For each blocker/high, read the few cited lines yourself to confirm.
-- **Confirmed defects → fix as commits** in the lane: smallest fix, its test red-then-green, `gate unit`, commit `fix: <what> (CB-n)`. Then `gate push` (background) and push — CI re-runs on the fix.
+- **Confirmed defects → fix as commits** in the lane: smallest fix, its test red-then-green, commit `fix: <what> (CB-n)`. After the last fix: one `gate push` (background) and push — CI re-runs on the fixes.
 - **Blocker/high fixes get one fresh re-check:** one new reviewer with just the finding and the fix commit. One pass, no loops.
 - **Decisions** (product, architecture, scope) → surface to the user; don't auto-decide.
 - **Pre-existing or out-of-diff defects** → report only. **Merely improvable code** → leave it (fix what's broken, never what's improvable).

@@ -17,7 +17,7 @@ Four stages, each operable from a fresh session via the lane's artifacts alone:
 ```
 
 - **scope** — resolves the ticket, creates the **lane** (its own worktree + branch from fresh `origin/main`), sizes the work S/M/L (L gets split), researches as much as the size needs, and writes an approvable `.lane/PLAN.md`: acceptance criteria, one-commit units, docs impact, what CI will run. Research-only mode answers "how does X work" with no lane.
-- **build** — per unit: ground, red test, code, `gate unit`, commit `… (CB-n)`. `gate push` before every push; the first push opens a draft PR; `ci-watch` keeps CI green in the background.
+- **build** — per unit: ground, red test, code, commit `… (CB-n)` — only the unit's own tests run. Typecheck, lint and the rest of the CI prep (`gate push`) run **once**, when every unit works; then push, draft PR, and `ci-watch` keeps CI green in the background.
 - **verify** — top-level session only, in parallel with CI: one or two reviewers on the session's model see the plan, diff, gate and CI results — never the implementer's transcript — and confirmed defects are fixed as commits.
 - **ship** — catch up with main, CI green (or red only on proven inherited/flaky failures), attribution/PII sweep, PR body, mark ready, Linear to review. Never merges.
 - **commit-push** — ad-hoc commits outside a lane: this chat's edits only, grouped by the revert test, one approval, never co-authored.

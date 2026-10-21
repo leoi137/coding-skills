@@ -1,6 +1,6 @@
 ---
 name: build
-description: Implement an approved .lane/PLAN.md unit by unit inside its lane — ground each change against live code, see its test go red, make it green, run gate unit, commit it with the ticket ID — then gate push, push, open a draft PR on the first push, and keep CI green in the background. Resumable from a fresh session. Never marks the PR ready, never merges. Use after /scope.
+description: Implement an approved .lane/PLAN.md unit by unit inside its lane — ground each change against live code, see its test go red, make it green, commit it with the ticket ID — and only when every unit works, run the full gate once, push, open a draft PR and keep CI green in the background. Resumable from a fresh session. Never marks the PR ready, never merges. Use after /scope.
 ---
 
 # build
@@ -34,7 +34,7 @@ For each unit, in order:
 2. **Ground at point of use — region, not file.** Grep the symbol, read its surrounding region; whole files only under ~400 lines. A mismatch with the plan (missing symbol, different signature, other wiring) *is* the divergence trigger — see below.
 3. **Red first.** Write the unit's test from the acceptance criterion (the external spec, not your implementation) and run it: it must fail for the right reason. Record the failing line under `## Log` in PLAN.md. A test that never went red proves nothing.
 4. **Smallest complete change.** Idiomatic, minimally scoped; no dead code, debug output or leftover TODOs. Match the neighbors' conventions, but don't copy a local bad pattern into new code — flag it.
-5. **Green** — the unit's own `verify:` command from the plan passes — then `gate unit` (`run_in_background: true`; wait for the notification). Fix what it finds — including a slow-test flag (give the test an explicit timeout or make it faster) and suppressions without a `-- reason`. Never weaken an assertion to get green.
+5. **Green** — the unit's own test file(s) pass. Run **only those** (`pnpm --filter <pkg> exec vitest run <file>`): no typecheck, lint, prettier or `gate` per unit — they run once at the end. UI changes: the user checks them live. Never weaken an assertion to get green.
 6. **Inspect the diff:** only this unit's intent — no unrelated edits, generated churn, lockfile drift, secrets.
 7. **Commit:** `git add <this unit's paths>` → `git commit -m "<imperative subject> (CB-n)"` (match `git log` style; body only when the *why* isn't obvious). No attribution of any kind. Then tick the unit `[x]` in PLAN.md with its sha in `## Log`.
 8. One-line status, next unit.
@@ -45,19 +45,19 @@ For each unit, in order:
 
 ## Push, draft PR, CI — in the background, not at the end
 
-- **Push early:** after the first unit that gives CI something real to check (usually the first or second), not after the last. CI's integration suite is the one gate you can't run locally — let it start.
-- **Before every push:** `gate push` (background) — and don't edit the lane until it reports, or it fails as stale. Red → fix, commit, rerun. It merges `origin/main` first; resolve a conflict by hand, keeping both sides' intent, then rerun. Before the first push also run `lane conflicts`.
+- **Nothing is pushed until every unit is done and works** (the user has seen UI changes live where it matters).
+- **Then, once:** `lane conflicts`, and `gate push` (background) — typecheck, lint and the rest of the CI prep happen here, not before. Don't edit the lane until it reports, or it fails as stale. Red → fix (slow-test flag: explicit timeout or a faster test; suppressions need a `-- reason`), commit, rerun. It merges `origin/main` first; resolve a conflict by hand, keeping both sides' intent, then rerun.
 - **First push:** `git push -u origin <branch>`, then `gh pr create --draft --title "<subject> (CB-n)" --body "Part of CB-n …"` (one-paragraph summary + the acceptance criteria). `lane set <slug> pr=<n>`.
 - **Later pushes:** `git push` after `gate push` passes.
-- After each push: `~/.claude/skills/_bin/ci-watch <pr>` with `run_in_background: true`. On its result, act per the contract's CI classes — **ours**: fix, its test + `gate unit`, commit and **push at once** (the one push that doesn't wait for `gate push`), then run `gate push` in the background; **fixed-on-main**: merge `origin/main`, `gate push`, push; **flaky**: `gh run rerun <run> --failed` once; **inherited**: leave it, note it in `## Result`, tell the user.
+- After each push: `~/.claude/skills/_bin/ci-watch <pr>` with `run_in_background: true`. On its result, act per the contract's CI classes — **ours**: fix, its test, commit and **push at once** (the one push that doesn't wait for `gate push`), then run `gate push` in the background; **fixed-on-main**: merge `origin/main`, `gate push`, push; **flaky**: `gh run rerun <run> --failed` once; **inherited**: leave it, note it in `## Result`, tell the user.
 
 ## Subagents
 
-Up to 3 implementer subagents may build file-disjoint units in parallel in this worktree (never `isolation: "worktree"`). Each gets a self-contained prompt: the unit's plan line, its files, the acceptance criterion, the test standards, and "write the test first, run only that test file and report its failing line before you implement; never run typecheck, lint or a whole test suite (the machine has 16 GB shared by several sessions — the parent runs the gate); don't commit; don't touch files outside your unit". You record the red line in `## Log`, review the result, run `gate unit`, and commit it yourself. Retrieval stays deterministic (grep / read / test runs); a subagent is for judgment or a whole unit, never "is this symbol used".
+Up to 3 implementer subagents may build file-disjoint units in parallel in this worktree (never `isolation: "worktree"`). Each gets a self-contained prompt: the unit's plan line, its files, the acceptance criterion, the test standards, and "write the test first, run only that test file and report its failing line before you implement; never run typecheck, lint or a whole test suite (the machine has 16 GB shared by several sessions — the parent runs the gate); don't commit; don't touch files outside your unit". You record the red line in `## Log`, review the result, and commit it yourself. Retrieval stays deterministic (grep / read / test runs); a subagent is for judgment or a whole unit, never "is this symbol used".
 
 ## Follow-ups after the units
 
-Review comments, `/verify` findings handed back, or CI fixes after every unit is done: append a unit `- [ ] F<n> …` under `## Units` (the approval covers it) and run the same loop — red test, fix, `gate unit`, commit, push.
+Review comments, `/verify` findings handed back, or CI fixes after every unit is done: append a unit `- [ ] F<n> …` under `## Units` (the approval covers it) and run the same loop — red test, fix, commit; push with `gate push` once the follow-ups are done (a CI fix pushes at once).
 
 ## Divergence
 

@@ -20,7 +20,7 @@ Kill switch for every hook and slot: `LANES_OFF=1`.
 |---|---|---|
 | `heavy-guard.sh` | PreToolUse Bash | wraps heavy commands in `heavy` via `updatedInput` — **bypassPermissions sessions only** |
 | `commit-guard.sh` | PreToolUse Bash | denies a commit / PR body carrying Co-Authored-By or "Generated with" |
-| `agent-guard.sh` | PreToolUse Agent | denies a subagent call without `model` opus/fable (forks exempt) |
+| `agent-guard.sh` | PreToolUse Agent | sets every subagent's `model` to the session's model (read from the transcript), so subagents never silently run on Fable or a cheaper default; never denies |
 
 Install (in `~/.claude/settings.json`, next to the ticket gate):
 

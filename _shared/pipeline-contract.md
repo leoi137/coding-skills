@@ -6,9 +6,9 @@ Shared contract for the five pipeline stages: `/research-plan → /write-plan �
 
 Every stage must be fully operable from the artifacts alone — assume the conversation contains nothing. For long pipelines, prefer starting each stage in a fresh session (`/clear`): accuracy decays and tokens compound when one stage carries another's full context. If a stage needs something that isn't in an artifact, that's a bug in the previous stage — flag it, don't reconstruct from memory.
 
-## Model floor (non-negotiable)
+## Model (non-negotiable)
 
-Every `Agent` call in every stage runs on the frontier tier — **Opus or Fable, never below Opus-class** (never Sonnet/Haiku). Default to the session model when that's Opus or Fable; if the session model is lower, pin `'opus'`. Pass the model **explicitly** on every call — omission can fall through to a cheaper agent-type default. Fail-closed: if no frontier model is available, stop and report that the stage can't proceed under policy.
+Every `Agent` call in every stage runs on **the model the user chose for this session** — never a different one, up or down. Don't reach for Fable or Opus as a "second opinion" unless the user asks; Fable burns through the token budget. The `agent-guard` hook (`_bin/hooks/agent-guard.sh`) sets `model` to the session's model on every call, so an omitted or different model is rewritten; independence between reviewers comes from framing and inputs, not model choice.
 
 ## Universal rules
 

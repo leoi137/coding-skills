@@ -5,11 +5,11 @@ description: Implement a ready plans/TODO_<feature>.md plan as a sequence of coh
 
 # execute-plan
 
-**Read `~/.claude/skills/_shared/pipeline-contract.md` first** — it defines the TODO schema, manifest format, model floor, and universal rules. Stage 3 of the pipeline. The checklist is how you stay on track; the uncommitted working-tree diff is how the user reads your work.
+**Read `~/.claude/skills/_shared/pipeline-contract.md` first** — it defines the TODO schema, manifest format, model rule, and universal rules. Stage 3 of the pipeline. The checklist is how you stay on track; the uncommitted working-tree diff is how the user reads your work.
 
 Goal: turn an approved plan into working, locally-verified code with **tight feedback loops** and **no sidetracking** — leaving the TODO checkpointed well enough that a fresh session could take over after any unit.
 
-> **Model floor:** subagents run Opus or Fable — never below Opus-class — passed explicitly. But **use deterministic tools for retrieval** (grep / read / test runs); spend a subagent only on *judgment* ("which of these implementations is live at runtime?"), never on "is this symbol used" (that's grep). Full policy in the contract.
+> **Model:** subagents run on the session's model (the agent-guard hook enforces it). But **use deterministic tools for retrieval** (grep / read / test runs); spend a subagent only on *judgment* ("which of these implementations is live at runtime?"), never on "is this symbol used" (that's grep). Full policy in the contract.
 
 ## Preconditions
 

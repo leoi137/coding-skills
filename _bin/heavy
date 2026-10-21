@@ -8,10 +8,10 @@
 #   heavy classify '<shell command>'  slots a command needs (empty = not heavy); used by the hook
 #
 # Slots: tsc · test · docker · build — one holder each. `build` also takes `tsc` (next build runs tsc).
-# Slots are taken in a fixed order (all or nothing), then held while waiting for memory admission:
-# memory pressure not critical, and either pressure normal or ≥ HEAVY_MIN_FREE_MB free, and load1 <
-# HEAVY_MAX_LOAD. Admission waits at most HEAVY_ADMIT_MAX seconds, then runs with a logged warning —
-# the slots already serialize the work, and a queue that never drains wedges every session.
+# Slots are taken in a fixed order (all or nothing). The slots are the RAM guard; admission only
+# holds a run back while memory pressure is critical or load1 ≥ HEAVY_MAX_LOAD, for at most
+# HEAVY_ADMIT_MAX (60) seconds. (A free-RAM threshold made nearly every run wait the full 10 minutes:
+# this Mac sits at "warn" pressure most of the day — 2026-10-21 heavy.log.)
 #
 # --wait-max SEC: give up waiting for a slot after SEC seconds with exit 75 (EX_TEMPFAIL) and the
 # owner on stderr. The PreToolUse hook passes 60 for foreground Bash calls (10-minute tool cap).
@@ -25,9 +25,8 @@ set -uo pipefail
 
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/lib/common.sh" || exit 1
 
-HEAVY_MIN_FREE_MB="${HEAVY_MIN_FREE_MB:-3072}"
-HEAVY_MAX_LOAD="${HEAVY_MAX_LOAD:-10}"
-HEAVY_ADMIT_MAX="${HEAVY_ADMIT_MAX:-600}"
+HEAVY_MAX_LOAD="${HEAVY_MAX_LOAD:-24}"
+HEAVY_ADMIT_MAX="${HEAVY_ADMIT_MAX:-60}"
 LOCKS="$LANES_HOME/locks"
 LOG="$LANES_HOME/heavy.log"
 LEGACY_LOCK=/tmp/claude-ob-heavy.lock
@@ -255,11 +254,7 @@ try_all() {
 }
 
 admitted() {
-  local p free load
-  p=$(pressure); free=$(lanes_free_mb); load=$(lanes_load1)
-  [ "$p" -ge 4 ] && return 1
-  [ "$load" -lt "$HEAVY_MAX_LOAD" ] || return 1
-  [ "$p" -le 1 ] || [ "$free" -ge "$HEAVY_MIN_FREE_MB" ]
+  [ "$(pressure)" -lt 4 ] && [ "$(lanes_load1)" -lt "$HEAVY_MAX_LOAD" ]
 }
 
 cmd_status() {

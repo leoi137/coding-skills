@@ -6,7 +6,7 @@ Kill switch for every hook and slot: `LANES_OFF=1`.
 
 | Script | Job |
 |---|---|
-| `lane` | `new <slug> --ticket CB-n` (worktree from fresh origin/main + env files + install + registry), `enter`, `list`, `gc` (dry run; `--apply` after the user approves), `claim`/`release`, `stats` |
+| `lane` | `new <slug> [--ticket CB-n]` (worktree from fresh origin/main + env files + install + registry), `enter`, `here`, `set` (stage/PR/size), `list`, `conflicts` (overlap with other lanes and open PRs), `drop`, `gc` (dry run; `--apply` after the user approves), `claim`/`release`, `stats` |
 | `lane-stats` | first-push-green baseline per author and size class (`lane stats`) |
 | `heavy` | machine-wide slots `tsc` `test` `docker` `build` + memory admission; `heavy status`, `heavy classify '<cmd>'` |
 | `gate` | `unit` after every unit · `push` before every push (run in background) · `impact` for the plan; writes `<worktree>/.lane/gate.json` |
@@ -18,7 +18,7 @@ Kill switch for every hook and slot: `LANES_OFF=1`.
 
 | Hook | Event | Does |
 |---|---|---|
-| `heavy-guard.sh` | PreToolUse Bash | wraps heavy commands in `heavy` via `updatedInput` — **bypassPermissions sessions only** |
+| `heavy-guard.sh` | PreToolUse Bash | wraps heavy commands in `heavy` via `updatedInput` — **bypassPermissions and auto sessions only** (permission rules see the rewritten command) |
 | `commit-guard.sh` | PreToolUse Bash | denies a commit / PR body carrying Co-Authored-By or "Generated with" |
 | `agent-guard.sh` | PreToolUse Agent | sets every subagent's `model` to the session's model (read from the transcript), so subagents never silently run on Fable or a cheaper default; never denies |
 
@@ -38,5 +38,5 @@ Install (in `~/.claude/settings.json`, next to the ticket gate):
 - **CwdChanged** fires on a Bash `cd` (`old_cwd`, `new_cwd`), not on EnterWorktree/ExitWorktree. Every hook payload's `cwd` reflects the worktree after entry.
 - **Subagents** share the parent's `session_id` in hook payloads, plus `agent_id` / `agent_type`. So ticket bindings by session cover subagents.
 - **Agent hook:** `tool_name` is `Agent`; the model is `tool_input.model`, absent when omitted.
-- **updatedInput** applies without a permission decision, and permission rules are checked against the *rewritten* input — so wrapping breaks allow rules in non-bypass sessions (hence heavy-guard's bypass-only rule). Several hooks returning updatedInput: last to finish wins.
+- **updatedInput** applies without a permission decision, and permission rules are checked against the *rewritten* input — so wrapping breaks allow rules in default-mode sessions. Auto mode's classifier ran a wrapped command without a prompt (2026-10-21), so heavy-guard rewrites in bypassPermissions and auto only. Several hooks returning updatedInput: last to finish wins.
 - `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PID` are set in every Bash call; `~/.claude/sessions/<pid>.json` gives the peer name.

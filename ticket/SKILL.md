@@ -37,7 +37,7 @@ Resolve once per piece of work, not per edit. Order:
 4. **Bind** (§2).
 
 **Creating a ticket.** `save_issue` with:
-- `team` from the config. `assignee: "me"`. `state`: the started status, because work starts now. For side findings (§3), use backlog.
+- `team` from the config. `assignee: "me"`. `state`: the started status, because work starts now.
 - `title`: the observable outcome or the problem, in the team's voice: "The Build card lists the 360+ services and 487-investor lines", "Home arrival: step message renders outside the centre circle". Never "Fix bug" or "Update X".
 - `labels`: exactly one child of every group in `requiredLabelGroups` (here **Type** and **Area**; the label descriptions say which fits), plus an optional **Surface** when the work is on one. Get the current names from `list_issue_labels` with `team` and `includeGroups: true`; don't guess them.
 - `project` and, when one fits, `milestone`: the best fit among `list_projects` for the team (started or planned). If nothing clearly fits, leave it empty and say so in the preview. Don't force it.
@@ -82,7 +82,7 @@ In the pipeline, `/scope` does this step and then creates the effort's lane with
 
 **Long tickets.** A ticket that outlives a session needs nothing special. The next session's gate offers it first ("recent"), and one click resumes it.
 
-**Side findings** (bugs or debt noticed along the way). Don't write them into the bound ticket's description, and don't interrupt the work for each one. Collect them, then at the next natural pause (before committing is the usual one) propose them to the user as one batch. Each one approved becomes its own ticket in the backlog state, `relatedTo` the bound ticket, with the contract body.
+**Side findings** (bugs or debt noticed along the way). Don't write them into the bound ticket's description, and don't interrupt the work for each one. Collect them, then at the next natural pause (before committing is the usual one) propose them to the user as one batch. The approved ones go into **one comment** on the bound ticket (what, where, why it matters) — never new tickets: one ticket per task. If the user later wants one fixed, that's a new piece of work they start.
 
 **Description vs comments.** The description is the contract; change it only when the scope itself changes, and leave a comment saying what changed and why. Progress, results and hand-offs go in **comments** (`save_comment`), never appended to the description.
 

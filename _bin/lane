@@ -11,6 +11,8 @@
 #   lane gc [--apply]           classify every worktree; REMOVE only if its PR is merged/closed, the
 #                               tree is clean, every commit is on a remote, and nothing lives in it.
 #                               Dry run by default — the user approves before --apply.
+#   lane here [--json]          the lane whose worktree holds the cwd (resume from a fresh session)
+#   lane set <slug> k=v …       update a record: stage=scope|build|verify|ship|shipped, pr=<n>, size=S|M|L
 #   lane claim <name> / lane release <name>   atomic named claims (migration:0226, dev-stack, main-red:<sig>)
 #   lane stats [...]            first-push-green baseline (lane-stats)
 #
@@ -25,7 +27,7 @@ set -uo pipefail
 REG="$LANES_HOME/registry"
 CLAIMS="$LANES_HOME/claims"
 
-usage() { sed -n '2,24p' "$0"; }
+usage() { sed -n '2,26p' "$0"; }
 
 reg_file() { printf '%s/%s.json' "$REG" "$1"; }
 
@@ -152,6 +154,41 @@ cmd_list() {
   done | column -t -s "$(printf '\t')"
 }
 
+cmd_here() {
+  local top f
+  top=$(lanes_toplevel) || lanes_die "not inside a git checkout"
+  top=$(cd "$top" && pwd -P)
+  for f in "$REG"/*.json; do
+    [ -f "$f" ] || continue
+    if [ "$(jq -r .worktree "$f")" = "$top" ]; then
+      if [ "${1:-}" = --json ]; then jq --arg o "$(owner_state "$f")" '. + {ownerState: $o}' "$f"
+      else jq -r '"\(.slug)  \(.ticket)  size \(.size // "-")  stage \(.stage)  PR \(.pr // "-")  \(.worktree)"' "$f"; fi
+      return 0
+    fi
+  done
+  lanes_die "no registered lane at $top (lane list)"
+}
+
+cmd_set() {
+  local slug="${1:-}" f kv k v; shift || true
+  f=$(reg_file "$slug"); [ -f "$f" ] || lanes_die "no lane '$slug'"
+  [ $# -gt 0 ] || lanes_die "usage: lane set <slug> stage=… pr=… size=…"
+  for kv in "$@"; do
+    k="${kv%%=*}"; v="${kv#*=}"
+    case "$k" in
+      stage) case "$v" in scope|build|verify|ship|shipped) ;; *) lanes_die "stage: scope|build|verify|ship|shipped" ;; esac
+             jq --arg v "$v" '.stage = $v' "$f" | lanes_write "$f" ;;
+      pr) printf '%s' "$v" | grep -Eq '^[0-9]+$' || lanes_die "pr must be a number"
+          jq --argjson v "$v" '.pr = $v' "$f" | lanes_write "$f" ;;
+      size) case "$v" in S|M|L) ;; *) lanes_die "size: S|M|L" ;; esac
+            jq --arg v "$v" '.size = $v' "$f" | lanes_write "$f" ;;
+      *) lanes_die "unknown key '$k' (stage, pr, size)" ;;
+    esac
+  done
+  jq --arg t "$(lanes_now)" '.heartbeat = $t' "$f" | lanes_write "$f"
+  jq -c '{slug, stage, pr, size}' "$f"
+}
+
 # --- gc ----------------------------------------------------------------------------------------
 
 # cwd of every live process, once (lsof is the slow part)
@@ -259,6 +296,8 @@ case "${1:-}" in
   new) shift; cmd_new "$@" ;;
   enter) shift; cmd_enter "$@" ;;
   list|ls) shift; cmd_list "$@" ;;
+  here) shift; cmd_here "$@" ;;
+  set) shift; cmd_set "$@" ;;
   gc) shift; cmd_gc "$@" ;;
   claim) shift; cmd_claim "$@" ;;
   release) shift; cmd_release "$@" ;;

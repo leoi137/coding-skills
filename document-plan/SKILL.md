@@ -5,11 +5,11 @@ description: Update project documentation to match the changes a plan made — s
 
 # document-plan
 
-**Read `~/.claude/skills/_shared/pipeline-contract.md` first** — it defines the manifest format, artifact lifecycle, model floor, and universal rules. Final stage of the pipeline. This is the deliberate moment to *write* to docs: earlier stages only read docs and flag drift; this stage fixes it, once the change is confirmed correct.
+**Read `~/.claude/skills/_shared/pipeline-contract.md` first** — it defines the manifest format, artifact lifecycle, model rule, and universal rules. Final stage of the pipeline. This is the deliberate moment to *write* to docs: earlier stages only read docs and flag drift; this stage fixes it, once the change is confirmed correct.
 
 Goal: keep the docs true to the code by updating **only the documentation the just-shipped change actually affects** — no drift, no bloat, no sidetracking.
 
-> **Model floor:** every `Agent` call runs Opus or Fable — never below Opus-class — passed explicitly. Full policy in the contract; fail closed if no frontier model is available.
+> **Model:** every `Agent` call runs on the session's model (the agent-guard hook enforces it). Full policy in the contract.
 
 ## Preconditions
 

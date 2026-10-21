@@ -5,11 +5,11 @@ description: Investigate a feature or area of the codebase using isolated Explor
 
 # research-plan
 
-**Read `~/.claude/skills/_shared/pipeline-contract.md` first** — it defines artifact locations, the brief schema, the model floor, and the universal rules. Stage 1 of the pipeline; the brief is the only thing that flows forward.
+**Read `~/.claude/skills/_shared/pipeline-contract.md` first** — it defines artifact locations, the brief schema, the model rule, and the universal rules. Stage 1 of the pipeline; the brief is the only thing that flows forward.
 
 Goal: produce an accurate, decision-useful model of a feature **without polluting the parent context** — heavy reading happens in subagents, only compressed findings return here. "Decision-useful," not "complete": you're done once the brief covers entry points, data/control flow, state & persistence, auth/flags/error boundaries, relevant tests, and the open risks. Don't research past that.
 
-> **Model floor:** every `Agent` call runs Opus or Fable — never below Opus-class — and the model is passed explicitly on every call. Full policy in the contract; fail closed if no frontier model is available.
+> **Model:** every `Agent` call runs on the session's model (the agent-guard hook enforces it). Full policy in the contract.
 
 ## How to run
 

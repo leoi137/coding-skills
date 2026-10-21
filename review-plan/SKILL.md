@@ -5,11 +5,11 @@ description: Independently review just the changes a plan made — scoped to tha
 
 # review-plan
 
-**Read `~/.claude/skills/_shared/pipeline-contract.md` first** — it defines the manifest format, finding format, model floor, and universal rules. Stage 4 of the pipeline. Independence comes from reviewers seeing the *artifacts and code*, never the implementer's reasoning — this stage must work identically in a fresh session.
+**Read `~/.claude/skills/_shared/pipeline-contract.md` first** — it defines the manifest format, finding format, model rule, and universal rules. Stage 4 of the pipeline. Independence comes from reviewers seeing the *artifacts and code*, never the implementer's reasoning — this stage must work identically in a fresh session.
 
 Goal: go over **only the changes this plan made**, confirm they actually satisfy the goal, **fix what's broken**, and don't get sidetracked.
 
-> **Model floor:** every reviewer runs Opus or Fable — never below Opus-class — passed explicitly (full policy in the contract). All reviewers run at the same frontier tier; since two copies of one model share blind spots, independence is bought via **adversarial framing + spec re-derivation** (below), not model diversity.
+> **Model:** every reviewer runs on the session's model (the agent-guard hook enforces it; full policy in the contract). Since two copies of one model share blind spots, independence is bought via **adversarial framing + spec re-derivation** (below), not model diversity.
 
 ## Scope — the plan's manifest, NOT the whole diff
 

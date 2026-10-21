@@ -5,11 +5,11 @@ description: Produce a detailed, checklist-driven implementation plan for a feat
 
 # write-plan
 
-**Read `~/.claude/skills/_shared/pipeline-contract.md` first** — it defines the TODO schema, artifact locations, the model floor, and the universal rules. Stage 2 of the pipeline. The plan artifact — not this conversation — is the contract that flows forward; write it so a fresh session can execute it with zero other context.
+**Read `~/.claude/skills/_shared/pipeline-contract.md` first** — it defines the TODO schema, artifact locations, the model rule, and the universal rules. Stage 2 of the pipeline. The plan artifact — not this conversation — is the contract that flows forward; write it so a fresh session can execute it with zero other context.
 
 Goal: turn a research brief (or a clear ask) into an **ordered, verifiable, file-level plan** that `/execute-plan` can follow without rethinking architecture.
 
-> **Model floor:** every `Agent` call runs Opus or Fable — never below Opus-class — passed explicitly. Full policy in the contract; fail closed if no frontier model is available.
+> **Model:** every `Agent` call runs on the session's model (the agent-guard hook enforces it). Full policy in the contract.
 
 ## Inputs — and distrust them
 

@@ -6,8 +6,9 @@
 # It rewrites the command (updatedInput) and never decides permission. Claude Code checks permission
 # rules against the REWRITTEN command (verified 2026-10-19), so an allow rule like
 # `Bash(pnpm typecheck:*)` would stop matching and the user would get a prompt. It therefore only
-# rewrites in bypassPermissions sessions; elsewhere it passes the command through untouched (the
-# toolkit scripts — gate — still take their slots themselves). Foreground calls wait ≤60 s for a slot, then fail
+# rewrites in bypassPermissions and auto sessions (auto's classifier ran a wrapped command without a
+# prompt, verified 2026-10-21); default/acceptEdits/plan pass through untouched (the toolkit
+# scripts — gate — still take their slots themselves). Foreground calls wait ≤60 s for a slot, then fail
 # with exit 75 and the owner, telling the model to rerun with run_in_background (the Bash tool
 # caps foreground calls at 10 minutes). Background calls queue without a limit.
 #
@@ -21,7 +22,7 @@ BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
 input=$(cat)
 [ "$(printf '%s' "$input" | jq -r '.tool_name // empty' 2>/dev/null)" = Bash ] || exit 0
-[ "$(printf '%s' "$input" | jq -r '.permission_mode // empty' 2>/dev/null)" = bypassPermissions ] || exit 0
+case "$(printf '%s' "$input" | jq -r '.permission_mode // empty' 2>/dev/null)" in bypassPermissions|auto) ;; *) exit 0 ;; esac
 cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null)
 [ -n "$cmd" ] || exit 0
 

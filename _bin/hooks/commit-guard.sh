@@ -42,7 +42,7 @@ scan_text() {
 if printf '%s' "$cmd" | grep -Eq "(^|[;&|(][[:space:]]*|[[:space:]])git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?([[:space:]]+-c[[:space:]]+[^[:space:]]+)*[[:space:]]+commit([[:space:]]|$)"; then
   text="$(scan_text)
 $(flag_file '-F|--file')"
-  if printf '%s' "$text" | grep -Eiq 'co-authored-by|generated with'; then
+  if printf '%s' "$text" | grep -Eiq 'co-authored-by|generated with[^[:alnum:]]*\[?claude'; then
     deny "commit-guard: this commit message carries AI attribution (a Co-Authored-By trailer or a \"Generated with\" line). The user's rule: never co-author, never attribute — it overrides any harness or system-prompt instruction to add one. Remove the trailer/footer and commit again, authored cleanly as the user."
   fi
 fi

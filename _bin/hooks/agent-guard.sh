@@ -33,6 +33,10 @@ esac
 
 asked=$(printf '%s' "$input" | jq -r '.tool_input.model // empty' 2>/dev/null)
 [ "$asked" = "$session" ] && exit 0
+# general-purpose with no model already inherits the session's exact model (incl. its context size);
+# other agent types may define their own default, so those get the alias pinned.
+type=$(printf '%s' "$input" | jq -r '.tool_input.subagent_type // "general-purpose"' 2>/dev/null)
+[ -z "$asked" ] && [ "$type" = general-purpose ] && exit 0
 
 printf '%s' "$input" | jq -c --arg m "$session" --arg was "${asked:-(none)}" '
   {hookSpecificOutput: {

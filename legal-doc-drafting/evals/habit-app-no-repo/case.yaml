@@ -1,0 +1,4 @@
+schema_version: "1.1"
+name: habit-app-no-repo
+expected_outcome: |
+  A privacy policy and terms of service for a non-financial iOS habit app that route cancellation through the App Store, disclose OpenAI and PostHog accurately without unverified vendor claims, cover Apple-required terms and in-app deletion, and contain no fintech or securities language.
